@@ -4,10 +4,9 @@ import {
   buildRemoteWebSocketUrl,
   eventKey,
   isTaskCompletedEvent,
-  routeIdFromHeaders,
+  routeIdFromRequestId,
 } from './protocol.js';
 
-const BOUND_TAB_KEY = 'boundChatTab';
 const REMOTE_SETTINGS_KEY = 'remoteRelay';
 const RECENT_EVENTS_KEY = 'recentEventIds';
 const ROUTE_BINDINGS_KEY = 'routeBindings';
@@ -31,53 +30,6 @@ const setBadge = async (text) => {
 };
 
 const isChatGptUrl = (url = '') => url.startsWith('https://chatgpt.com/');
-
-const bindTab = async (tab) => {
-  if (!tab?.id || !isChatGptUrl(tab.url)) {
-    await setBadge('!');
-    return;
-  }
-
-  await chrome.storage.local.set({
-    [BOUND_TAB_KEY]: {
-      tabId: tab.id,
-      url: tab.url,
-    },
-  });
-
-  await setBadge('ON');
-};
-
-const findBoundTab = async () => {
-  const stored = await chrome.storage.local.get(BOUND_TAB_KEY);
-  const binding = stored[BOUND_TAB_KEY];
-
-  if (!binding) return null;
-
-  if (binding.tabId) {
-    try {
-      const tab = await chrome.tabs.get(binding.tabId);
-      if (tab?.id && isChatGptUrl(tab.url)) return tab;
-    } catch {
-      // Fall back to the stored conversation URL.
-    }
-  }
-
-  if (!binding.url) return null;
-
-  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  const exact = tabs.find((tab) => tab.url === binding.url);
-  if (!exact?.id) return null;
-
-  await chrome.storage.local.set({
-    [BOUND_TAB_KEY]: {
-      tabId: exact.id,
-      url: exact.url,
-    },
-  });
-
-  return exact;
-};
 
 const getRouteBindings = async () => {
   const stored = await chrome.storage.local.get(ROUTE_BINDINGS_KEY);
@@ -110,6 +62,7 @@ const saveRouteBinding = async (routeId, tabId) => {
   };
 
   await chrome.storage.local.set({ [ROUTE_BINDINGS_KEY]: next });
+  await setBadge('ON');
 
   // Recycle the relay only when an unmatched completion is actually waiting
   // for this exact route. Normal ChatGPT traffic must not churn the socket.
@@ -145,14 +98,6 @@ const findTabForRoute = async (routeId) => {
 
   await saveRouteBinding(routeId.trim().toLowerCase(), exact.id);
   return exact;
-};
-
-const captureRouteFromHeaders = (details, headers) => {
-  const routeId = routeIdFromHeaders(headers);
-  if (!routeId || !Number.isInteger(details?.tabId) || details.tabId < 0) return;
-  saveRouteBinding(routeId, details.tabId).catch((error) => {
-    console.error('[AI Studio Bridge] Failed to remember route binding', error);
-  });
 };
 
 const ensureContentScript = async (tabId) => {
@@ -452,52 +397,49 @@ const restartRemoteBridge = () => {
 };
 
 
-const ROUTE_CAPTURE_FILTER = {
-  urls: [
-    'https://chatgpt.com/*',
-    'https://*.openai.com/*',
-  ],
-};
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== 'aiStudio.routeRegistered') return undefined;
 
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => captureRouteFromHeaders(details, details.requestHeaders),
-  ROUTE_CAPTURE_FILTER,
-  ['requestHeaders', 'extraHeaders'],
-);
+  const routeId = routeIdFromRequestId(message.routeId);
+  const tabId = sender.tab?.id;
+  if (!routeId || !Number.isInteger(tabId) || tabId < 0) {
+    sendResponse({ ok: false });
+    return false;
+  }
 
-chrome.webRequest.onHeadersReceived.addListener(
-  (details) => captureRouteFromHeaders(details, details.responseHeaders),
-  ROUTE_CAPTURE_FILTER,
-  ['responseHeaders', 'extraHeaders'],
-);
+  saveRouteBinding(routeId, tabId)
+    .then(() => sendResponse({ ok: true }))
+    .catch((error) => {
+      console.error('[AI Studio Bridge] Failed to register ChatGPT route', error);
+      sendResponse({ ok: false });
+    });
+  return true;
+});
 
 chrome.action.onClicked.addListener((tab) => {
-  bindTab(tab).catch((error) => {
-    console.error('[AI Studio Bridge] Failed to bind tab', error);
-  });
+  if (!tab?.id || !isChatGptUrl(tab.url)) {
+    setBadge('!').catch(() => {});
+    return;
+  }
+  chrome.tabs.sendMessage(tab.id, { type: 'aiStudio.requestRouteRegistration' })
+    .catch((error) => {
+      console.error('[AI Studio Bridge] Failed to request route registration', error);
+      setBadge('!').catch(() => {});
+    });
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const stored = await chrome.storage.local.get([BOUND_TAB_KEY, ROUTE_BINDINGS_KEY]);
-  const binding = stored[BOUND_TAB_KEY];
-
-  if (binding?.tabId === tabId) {
-    await chrome.storage.local.set({
-      [BOUND_TAB_KEY]: {
-        tabId: null,
-        url: binding.url,
-      },
-    });
-  }
-
+  const stored = await chrome.storage.local.get(ROUTE_BINDINGS_KEY);
   const routes = stored[ROUTE_BINDINGS_KEY] ?? {};
   let changed = false;
+
   for (const value of Object.values(routes)) {
     if (value?.tabId === tabId) {
       value.tabId = null;
       changed = true;
     }
   }
+
   if (changed) {
     await chrome.storage.local.set({ [ROUTE_BINDINGS_KEY]: routes });
   }

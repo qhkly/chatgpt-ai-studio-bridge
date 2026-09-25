@@ -11,18 +11,6 @@ export const routeIdFromRequestId = (value) => {
   return prefix.toLowerCase();
 };
 
-export const routeIdFromHeaders = (headers = []) => {
-  const normalized = headers ?? [];
-  for (const wanted of ['x-request-id', 'x-client-request-id', 'x-openai-request-id']) {
-    for (const header of normalized) {
-      if (String(header?.name ?? '').toLowerCase() !== wanted) continue;
-      const routeId = routeIdFromRequestId(header?.value);
-      if (routeId) return routeId;
-    }
-  }
-  return null;
-};
-
 export const isTaskCompletedEvent = (value) => {
   if (!value || typeof value !== 'object') return false;
   if (value.type !== 'task.completed') return false;
