@@ -85,6 +85,11 @@ const sendPrompt = async (prompt) => {
 };
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'aiStudio.ping') {
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type !== 'aiStudio.taskCompleted') return undefined;
 
   sendPrompt(message.prompt)

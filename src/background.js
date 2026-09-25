@@ -74,10 +74,36 @@ const findBoundTab = async () => {
   return exact;
 };
 
+const ensureContentScript = async (tabId) => {
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: 'aiStudio.ping' });
+    if (pong?.ok === true) return true;
+  } catch {
+    // The extension may have been reloaded while this ChatGPT tab stayed open.
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['src/content.js'],
+    });
+    const pong = await chrome.tabs.sendMessage(tabId, { type: 'aiStudio.ping' });
+    return pong?.ok === true;
+  } catch (error) {
+    console.error('[AI Studio Bridge] Failed to ensure content script', error);
+    return false;
+  }
+};
+
 const deliverCompletion = async (event) => {
   const tab = await findBoundTab();
 
   if (!tab?.id) {
+    await setBadge('!');
+    return false;
+  }
+
+  if (!(await ensureContentScript(tab.id))) {
     await setBadge('!');
     return false;
   }
