@@ -17,3 +17,9 @@
 - 插件仅操作 chatgpt.com 输入框和发送按钮。
 - AI Studio 只向 loopback WebSocket 发布事件。
 - Chrome 116+。后台每 20 秒发送一次 ping，维持 MV3 service worker WebSocket 活跃。
+
+## Remote relay
+
+The extension always keeps the localhost bridge as the fast path. When remote relay is enabled in Extension Options it also connects to the Cloudflare relay. eventId deduplication prevents the local and remote copies from sending the same ChatGPT message twice. Remote events are ACKed only after the ChatGPT page confirms the message was sent.
+
+The composer is never overwritten: if the user is typing, the notification waits until the composer is empty.

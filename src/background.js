@@ -19,6 +19,7 @@ let localReconnectTimer = null;
 let remoteReconnectTimer = null;
 let localPingTimer = null;
 let remotePingTimer = null;
+const processingEvents = new Set();
 
 const setBadge = async (text) => {
   await chrome.action.setBadgeText({ text });
@@ -133,11 +134,18 @@ const handleCompletion = async (event, source) => {
     return;
   }
 
-  const delivered = await deliverCompletion(event);
-  if (!delivered) return;
+  if (processingEvents.has(key)) return;
+  processingEvents.add(key);
 
-  await markDelivered(key);
-  if (source === 'remote') ackRemote(event);
+  try {
+    const delivered = await deliverCompletion(event);
+    if (!delivered) return;
+
+    await markDelivered(key);
+    if (source === 'remote') ackRemote(event);
+  } finally {
+    processingEvents.delete(key);
+  }
 };
 
 const parseBridgeMessage = async (raw, source) => {
