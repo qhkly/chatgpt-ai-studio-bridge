@@ -154,6 +154,16 @@ const ackRemote = (event) => {
 const handleCompletion = async (event, source) => {
   if (!isTaskCompletedEvent(event)) return;
 
+  // Fail closed: legacy/unrouted completion events must never be guessed into
+  // the globally bound ChatGPT tab. Until the producer supplies a routeId,
+  // drop the event. Remote events are ACKed so the relay does not replay them
+  // forever and accidentally inject them after another tab becomes active.
+  if (typeof event.routeId !== 'string' || !event.routeId.trim()) {
+    console.warn('[AI Studio Bridge] Dropping unrouted completion event', event.eventId || event.sessionId);
+    if (source === 'remote') ackRemote(event);
+    return;
+  }
+
   const key = eventKey(event);
   if (await hasDelivered(key)) {
     if (source === 'remote') ackRemote(event);
