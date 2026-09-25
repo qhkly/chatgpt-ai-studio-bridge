@@ -19,7 +19,7 @@ let localReconnectTimer = null;
 let remoteReconnectTimer = null;
 let localPingTimer = null;
 let remotePingTimer = null;
-const processingEvents = new Set();
+let deliveryQueue = Promise.resolve();
 
 const setBadge = async (text) => {
   await chrome.action.setBadgeText({ text });
@@ -134,18 +134,25 @@ const handleCompletion = async (event, source) => {
     return;
   }
 
-  if (processingEvents.has(key)) return;
-  processingEvents.add(key);
-
-  try {
-    const delivered = await deliverCompletion(event);
-    if (!delivered) return;
-
-    await markDelivered(key);
-    if (source === 'remote') ackRemote(event);
-  } finally {
-    processingEvents.delete(key);
+  const delivered = await deliverCompletion(event);
+  if (!delivered) {
+    if (source === 'remote' && remoteSocket?.readyState === WebSocket.OPEN) {
+      remoteSocket.close();
+    }
+    return;
   }
+
+  await markDelivered(key);
+  if (source === 'remote') ackRemote(event);
+};
+
+const enqueueCompletion = (event, source) => {
+  deliveryQueue = deliveryQueue
+    .then(() => handleCompletion(event, source))
+    .catch((error) => {
+      console.error('[AI Studio Bridge] Completion queue failed', error);
+    });
+  return deliveryQueue;
 };
 
 const provisionRemoteRelay = async (remoteRelay) => {
@@ -196,7 +203,7 @@ const parseBridgeMessage = async (raw, source) => {
   }
   if (event?.type === 'pong') return;
 
-  await handleCompletion(event, source);
+  await enqueueCompletion(event, source);
 };
 
 const clearTimer = (timer) => {
