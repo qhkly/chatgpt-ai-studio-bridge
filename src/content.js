@@ -10,6 +10,14 @@ const findSendButton = () =>
   document.querySelector('button[aria-label="Send prompt"]') ||
   document.querySelector('button[aria-label="发送提示"]');
 
+const composerText = (element) => {
+  if (element instanceof HTMLTextAreaElement) {
+    return element.value.trim();
+  }
+
+  return (element.textContent ?? '').trim();
+};
+
 const setTextareaValue = (element, text) => {
   const descriptor = Object.getOwnPropertyDescriptor(
     HTMLTextAreaElement.prototype,
@@ -59,7 +67,7 @@ const sendPrompt = async (prompt) => {
   while (Date.now() < deadline) {
     const composer = findComposer();
 
-    if (composer) {
+    if (composer && composerText(composer) === '') {
       writePrompt(composer, prompt);
       await sleep(100);
 
@@ -76,10 +84,15 @@ const sendPrompt = async (prompt) => {
   return false;
 };
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type !== 'aiStudio.taskCompleted') return;
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'aiStudio.taskCompleted') return undefined;
 
-  sendPrompt(message.prompt).catch((error) => {
-    console.error('[AI Studio Bridge] Failed to send prompt', error);
-  });
+  sendPrompt(message.prompt)
+    .then((ok) => sendResponse({ ok }))
+    .catch((error) => {
+      console.error('[AI Studio Bridge] Failed to send prompt', error);
+      sendResponse({ ok: false });
+    });
+
+  return true;
 });

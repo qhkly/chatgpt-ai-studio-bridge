@@ -1,4 +1,5 @@
 export const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:17373/events';
+export const DEFAULT_REMOTE_RELAY_URL = 'https://notify.qhkly.com';
 
 export const isTaskCompletedEvent = (value) => {
   if (!value || typeof value !== 'object') return false;
@@ -8,6 +9,15 @@ export const isTaskCompletedEvent = (value) => {
   return typeof sessionId === 'string' && sessionId.length > 0;
 };
 
+export const eventKey = (event) => {
+  if (typeof event?.eventId === 'string' && event.eventId.length > 0) {
+    return event.eventId;
+  }
+
+  const id = event?.sessionId ?? event?.taskId ?? 'unknown';
+  return id + ':' + String(event?.finishedAt ?? '');
+};
+
 export const buildCompletionPrompt = (event) => {
   const id = event.sessionId ?? event.taskId;
   const title = event.title ? '「' + event.title + '」' : id;
@@ -15,4 +25,19 @@ export const buildCompletionPrompt = (event) => {
 
   return 'AI Studio 工人任务 ' + title + ' 已完成' + project +
     '。请查看该工人的 CLI 输出和代码改动，审查结果并继续处理下一步。任务/session ID：' + id;
+};
+
+export const buildRemoteWebSocketUrl = (relayUrl, token) => {
+  const url = new URL(relayUrl || DEFAULT_REMOTE_RELAY_URL);
+
+  if (url.protocol === 'https:') url.protocol = 'wss:';
+  else if (url.protocol === 'http:') url.protocol = 'ws:';
+  else if (!['ws:', 'wss:'].includes(url.protocol)) {
+    throw new Error('Relay URL must use http, https, ws, or wss');
+  }
+
+  url.pathname = url.pathname.replace(/\/$/, '') + '/ws';
+  url.search = '';
+  url.searchParams.set('token', token);
+  return url.toString();
 };

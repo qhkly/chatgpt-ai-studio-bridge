@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "AI Studio → ChatGPT Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Send WebCode AI Studio worker completion events to the bound ChatGPT conversation.",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "tabs"],
   "host_permissions": [
     "https://chatgpt.com/*",
-    "http://127.0.0.1/*"
+    "http://127.0.0.1/*",
+    "https://notify.qhkly.com/*"
   ],
   "background": {
     "service_worker": "src/background.js",
@@ -16,6 +17,7 @@
   "action": {
     "default_title": "Bind this ChatGPT conversation"
   },
+  "options_page": "options.html",
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],

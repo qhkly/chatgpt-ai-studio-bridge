@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import {
   buildCompletionPrompt,
+  buildRemoteWebSocketUrl,
+  eventKey,
   isTaskCompletedEvent,
 } from '../src/protocol.js';
 
@@ -33,4 +35,29 @@ test('builds a continuation prompt with task identity', () => {
   assert.match(prompt, /修复通知桥/);
   assert.match(prompt, /webcode-ai-studio/);
   assert.match(prompt, /session-1/);
+});
+
+test('uses eventId for cross-channel deduplication', () => {
+  assert.equal(
+    eventKey({
+      eventId: 'evt-1',
+      sessionId: 'session-1',
+      finishedAt: 123,
+    }),
+    'evt-1',
+  );
+  assert.equal(
+    eventKey({
+      sessionId: 'session-1',
+      finishedAt: 123,
+    }),
+    'session-1:123',
+  );
+});
+
+test('builds authenticated remote websocket URL', () => {
+  assert.equal(
+    buildRemoteWebSocketUrl('https://notify.qhkly.com', 'secret'),
+    'wss://notify.qhkly.com/ws?token=secret',
+  );
 });

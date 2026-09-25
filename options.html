@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Studio Bridge 设置</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; max-width: 620px; margin: 40px auto; padding: 0 20px; }
+    label { display: block; margin: 16px 0 6px; font-weight: 600; }
+    input[type="url"], input[type="password"] { width: 100%; box-sizing: border-box; padding: 9px 10px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+    .hint { color: #666; margin-top: 6px; }
+    button { margin-top: 20px; padding: 8px 16px; }
+    #status { margin-left: 10px; }
+  </style>
+</head>
+<body>
+  <h1>AI Studio → ChatGPT Bridge</h1>
+  <div class="row">
+    <input id="enabled" type="checkbox">
+    <label for="enabled" style="margin:0">启用 Cloudflare 远程中继</label>
+  </div>
+
+  <label for="url">Relay 地址</label>
+  <input id="url" type="url" placeholder="https://notify.qhkly.com">
+  <div class="hint">同机仍优先走 localhost；远程中继用于跨网络和断线补发。</div>
+
+  <label for="token">Relay Token</label>
+  <input id="token" type="password" autocomplete="off">
+
+  <button id="save" type="button">保存</button>
+  <span id="status"></span>
+
+  <script type="module" src="src/options.js"></script>
+</body>
+</html>
