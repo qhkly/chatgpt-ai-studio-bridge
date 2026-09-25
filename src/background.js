@@ -148,6 +148,37 @@ const handleCompletion = async (event, source) => {
   }
 };
 
+const provisionRemoteRelay = async (remoteRelay) => {
+  if (
+    !remoteRelay ||
+    typeof remoteRelay.url !== 'string' ||
+    !remoteRelay.url ||
+    typeof remoteRelay.token !== 'string' ||
+    !remoteRelay.token
+  ) {
+    return;
+  }
+
+  const next = {
+    enabled: true,
+    url: remoteRelay.url,
+    token: remoteRelay.token,
+  };
+  const current = await getRemoteSettings();
+
+  if (
+    current.enabled === next.enabled &&
+    current.url === next.url &&
+    current.token === next.token
+  ) {
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [REMOTE_SETTINGS_KEY]: next,
+  });
+};
+
 const parseBridgeMessage = async (raw, source) => {
   let event;
 
@@ -157,7 +188,14 @@ const parseBridgeMessage = async (raw, source) => {
     return;
   }
 
-  if (event?.type === 'hello' || event?.type === 'pong') return;
+  if (event?.type === 'hello') {
+    if (source === 'local') {
+      await provisionRemoteRelay(event.remoteRelay);
+    }
+    return;
+  }
+  if (event?.type === 'pong') return;
+
   await handleCompletion(event, source);
 };
 
