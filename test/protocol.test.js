@@ -6,6 +6,8 @@ import {
   buildRemoteWebSocketUrl,
   eventKey,
   isTaskCompletedEvent,
+  routeIdFromHeaders,
+  routeIdFromRequestId,
 } from '../src/protocol.js';
 
 test('accepts a valid task.completed event', () => {
@@ -60,4 +62,35 @@ test('builds authenticated remote websocket URL', () => {
     buildRemoteWebSocketUrl('https://notify.qhkly.com', 'secret'),
     'wss://notify.qhkly.com/ws?token=secret',
   );
+});
+
+
+test('normalizes the stable UUID prefix from request ids', () => {
+  assert.equal(
+    routeIdFromRequestId('B72B6F8F-20CE-4C89-A54F-7CB52C9D0F42/1i20'),
+    'b72b6f8f-20ce-4c89-a54f-7cb52c9d0f42',
+  );
+  assert.equal(routeIdFromRequestId('not-a-route/1i20'), null);
+  assert.equal(routeIdFromRequestId(''), null);
+});
+
+test('prefers X-Request-Id over fallback request id headers', () => {
+  assert.equal(
+    routeIdFromHeaders([
+      { name: 'X-Client-Request-Id', value: '11111111-1111-1111-1111-111111111111/a' },
+      { name: 'X-Request-Id', value: '22222222-2222-2222-2222-222222222222/b' },
+    ]),
+    '22222222-2222-2222-2222-222222222222',
+  );
+});
+
+test('extracts a route id from request or response headers', () => {
+  assert.equal(
+    routeIdFromHeaders([
+      { name: 'content-type', value: 'application/json' },
+      { name: 'X-Request-Id', value: 'e7313570-0894-43db-81cd-def75c48c6a1/abcd' },
+    ]),
+    'e7313570-0894-43db-81cd-def75c48c6a1',
+  );
+  assert.equal(routeIdFromHeaders([{ name: 'x-request-id', value: 'bad' }]), null);
 });

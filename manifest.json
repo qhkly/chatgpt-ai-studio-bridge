@@ -1,18 +1,20 @@
 {
   "manifest_version": 3,
   "name": "AI Studio → ChatGPT Bridge",
-  "version": "0.2.0",
-  "description": "Send WebCode AI Studio worker completion events to the bound ChatGPT conversation.",
+  "version": "0.3.0",
+  "description": "Route WebCode AI Studio worker completion events back to the ChatGPT tab that created them.",
   "minimum_chrome_version": "116",
   "permissions": [
     "storage",
     "tabs",
-    "scripting"
+    "scripting",
+    "webRequest"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
     "http://127.0.0.1/*",
-    "https://notify.qhkly.com/*"
+    "https://notify.qhkly.com/*",
+    "https://*.openai.com/*"
   ],
   "background": {
     "service_worker": "src/background.js",

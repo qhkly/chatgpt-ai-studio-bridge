@@ -1,6 +1,28 @@
 export const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:17373/events';
 export const DEFAULT_REMOTE_RELAY_URL = 'https://notify.qhkly.com';
 
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const routeIdFromRequestId = (value) => {
+  if (typeof value !== 'string') return null;
+  const prefix = value.trim().split('/', 1)[0];
+  if (!UUID_RE.test(prefix)) return null;
+  return prefix.toLowerCase();
+};
+
+export const routeIdFromHeaders = (headers = []) => {
+  const normalized = headers ?? [];
+  for (const wanted of ['x-request-id', 'x-client-request-id', 'x-openai-request-id']) {
+    for (const header of normalized) {
+      if (String(header?.name ?? '').toLowerCase() !== wanted) continue;
+      const routeId = routeIdFromRequestId(header?.value);
+      if (routeId) return routeId;
+    }
+  }
+  return null;
+};
+
 export const isTaskCompletedEvent = (value) => {
   if (!value || typeof value !== 'object') return false;
   if (value.type !== 'task.completed') return false;

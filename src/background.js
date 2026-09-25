@@ -4,14 +4,18 @@ import {
   buildRemoteWebSocketUrl,
   eventKey,
   isTaskCompletedEvent,
+  routeIdFromHeaders,
 } from './protocol.js';
 
 const BOUND_TAB_KEY = 'boundChatTab';
 const REMOTE_SETTINGS_KEY = 'remoteRelay';
 const RECENT_EVENTS_KEY = 'recentEventIds';
+const ROUTE_BINDINGS_KEY = 'routeBindings';
 const RECONNECT_MS = 3000;
 const PING_MS = 20000;
 const MAX_RECENT_EVENTS = 100;
+const MAX_ROUTE_BINDINGS = 300;
+const ROUTE_TTL_MS = 24 * 60 * 60 * 1000;
 
 let localSocket = null;
 let remoteSocket = null;
@@ -20,6 +24,7 @@ let remoteReconnectTimer = null;
 let localPingTimer = null;
 let remotePingTimer = null;
 let deliveryQueue = Promise.resolve();
+const pendingRouteIds = new Set();
 
 const setBadge = async (text) => {
   await chrome.action.setBadgeText({ text });
@@ -74,6 +79,82 @@ const findBoundTab = async () => {
   return exact;
 };
 
+const getRouteBindings = async () => {
+  const stored = await chrome.storage.local.get(ROUTE_BINDINGS_KEY);
+  return stored[ROUTE_BINDINGS_KEY] ?? {};
+};
+
+const saveRouteBinding = async (routeId, tabId) => {
+  if (!routeId || !Number.isInteger(tabId) || tabId < 0) return;
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return;
+  }
+  if (!tab?.id || !isChatGptUrl(tab.url)) return;
+
+  const now = Date.now();
+  const bindings = await getRouteBindings();
+  const fresh = Object.entries(bindings)
+    .filter(([, value]) => value && now - Number(value.at || 0) <= ROUTE_TTL_MS)
+    .sort((a, b) => Number(b[1].at || 0) - Number(a[1].at || 0))
+    .slice(0, MAX_ROUTE_BINDINGS - 1);
+
+  const next = Object.fromEntries(fresh);
+  next[routeId] = {
+    tabId: tab.id,
+    url: tab.url,
+    at: now,
+  };
+
+  await chrome.storage.local.set({ [ROUTE_BINDINGS_KEY]: next });
+
+  // Recycle the relay only when an unmatched completion is actually waiting
+  // for this exact route. Normal ChatGPT traffic must not churn the socket.
+  if (
+    pendingRouteIds.delete(routeId) &&
+    remoteSocket?.readyState === WebSocket.OPEN
+  ) {
+    remoteSocket.close();
+  }
+};
+
+const findTabForRoute = async (routeId) => {
+  if (typeof routeId !== 'string' || !routeId.trim()) return null;
+
+  const bindings = await getRouteBindings();
+  const binding = bindings[routeId.trim().toLowerCase()];
+  if (!binding) return null;
+  if (Date.now() - Number(binding.at || 0) > ROUTE_TTL_MS) return null;
+
+  if (binding.tabId) {
+    try {
+      const tab = await chrome.tabs.get(binding.tabId);
+      if (tab?.id && isChatGptUrl(tab.url)) return tab;
+    } catch {
+      // Fall back to the exact stored conversation URL.
+    }
+  }
+
+  if (!binding.url) return null;
+  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  const exact = tabs.find((tab) => tab.url === binding.url);
+  if (!exact?.id) return null;
+
+  await saveRouteBinding(routeId.trim().toLowerCase(), exact.id);
+  return exact;
+};
+
+const captureRouteFromHeaders = (details, headers) => {
+  const routeId = routeIdFromHeaders(headers);
+  if (!routeId || !Number.isInteger(details?.tabId) || details.tabId < 0) return;
+  saveRouteBinding(routeId, details.tabId).catch((error) => {
+    console.error('[AI Studio Bridge] Failed to remember route binding', error);
+  });
+};
+
 const ensureContentScript = async (tabId) => {
   try {
     const pong = await chrome.tabs.sendMessage(tabId, { type: 'aiStudio.ping' });
@@ -96,16 +177,17 @@ const ensureContentScript = async (tabId) => {
 };
 
 const deliverCompletion = async (event) => {
-  const tab = await findBoundTab();
+  const tab = await findTabForRoute(event.routeId);
 
   if (!tab?.id) {
+    console.warn('[AI Studio Bridge] No ChatGPT tab matches route', event.routeId);
     await setBadge('!');
-    return false;
+    return 'unmatched';
   }
 
   if (!(await ensureContentScript(tab.id))) {
     await setBadge('!');
-    return false;
+    return 'failed';
   }
 
   try {
@@ -114,10 +196,10 @@ const deliverCompletion = async (event) => {
       prompt: buildCompletionPrompt(event),
       event,
     });
-    return result?.ok === true;
+    return result?.ok === true ? 'delivered' : 'failed';
   } catch (error) {
     console.error('[AI Studio Bridge] Failed to deliver completion event', error);
-    return false;
+    return 'failed';
   }
 };
 
@@ -170,14 +252,23 @@ const handleCompletion = async (event, source) => {
     return;
   }
 
-  const delivered = await deliverCompletion(event);
-  if (!delivered) {
+  const outcome = await deliverCompletion(event);
+  if (outcome === 'unmatched') {
+    // Leave a remote event unacked in the relay. When this exact route is
+    // later observed, saveRouteBinding recycles the socket and replay resumes.
+    if (source === 'remote') {
+      pendingRouteIds.add(event.routeId.trim().toLowerCase());
+    }
+    return;
+  }
+  if (outcome !== 'delivered') {
     if (source === 'remote' && remoteSocket?.readyState === WebSocket.OPEN) {
       remoteSocket.close();
     }
     return;
   }
 
+  pendingRouteIds.delete(event.routeId.trim().toLowerCase());
   await markDelivered(key);
   if (source === 'remote') ackRemote(event);
 };
@@ -360,6 +451,26 @@ const restartRemoteBridge = () => {
   connectRemoteBridge().catch(console.error);
 };
 
+
+const ROUTE_CAPTURE_FILTER = {
+  urls: [
+    'https://chatgpt.com/*',
+    'https://*.openai.com/*',
+  ],
+};
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => captureRouteFromHeaders(details, details.requestHeaders),
+  ROUTE_CAPTURE_FILTER,
+  ['requestHeaders', 'extraHeaders'],
+);
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => captureRouteFromHeaders(details, details.responseHeaders),
+  ROUTE_CAPTURE_FILTER,
+  ['responseHeaders', 'extraHeaders'],
+);
+
 chrome.action.onClicked.addListener((tab) => {
   bindTab(tab).catch((error) => {
     console.error('[AI Studio Bridge] Failed to bind tab', error);
@@ -367,7 +478,7 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const stored = await chrome.storage.local.get(BOUND_TAB_KEY);
+  const stored = await chrome.storage.local.get([BOUND_TAB_KEY, ROUTE_BINDINGS_KEY]);
   const binding = stored[BOUND_TAB_KEY];
 
   if (binding?.tabId === tabId) {
@@ -377,6 +488,18 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
         url: binding.url,
       },
     });
+  }
+
+  const routes = stored[ROUTE_BINDINGS_KEY] ?? {};
+  let changed = false;
+  for (const value of Object.values(routes)) {
+    if (value?.tabId === tabId) {
+      value.tabId = null;
+      changed = true;
+    }
+  }
+  if (changed) {
+    await chrome.storage.local.set({ [ROUTE_BINDINGS_KEY]: routes });
   }
 });
 
