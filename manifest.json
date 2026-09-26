@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Studio → ChatGPT Bridge",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Route WebCode AI Studio worker completion events back to the ChatGPT conversation that created them.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -19,7 +19,13 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Re-register this ChatGPT conversation"
+    "default_title": "Re-register this ChatGPT conversation",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "options_page": "options.html",
   "content_scripts": [
@@ -32,5 +38,11 @@
       ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }
