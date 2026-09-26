@@ -138,7 +138,8 @@ export const claimPairing = async ({
     return { ok: false, reason: 'bad-response' };
   }
 
-  const settings = { enabled: true, url: relayUrl, token: deviceToken };
+  // paired marks a per-device token, which a relay revocation may discard.
+  const settings = { enabled: true, url: relayUrl, token: deviceToken, paired: true };
   if (typeof deviceId === 'string' && deviceId) settings.deviceId = deviceId;
   return { ok: true, settings };
 };

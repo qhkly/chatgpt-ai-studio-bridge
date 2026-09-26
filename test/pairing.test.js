@@ -67,7 +67,7 @@ test('claimPairing posts the normalized code and returns relay settings', async 
 
   assert.deepEqual(result, {
     ok: true,
-    settings: { enabled: true, url: 'https://notify.qhkly.com', token: TOKEN, deviceId: 'dev-1' },
+    settings: { enabled: true, url: 'https://notify.qhkly.com', token: TOKEN, paired: true, deviceId: 'dev-1' },
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'https://notify.qhkly.com/v1/pairings/claim');

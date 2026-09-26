@@ -27,8 +27,9 @@ save.addEventListener('click', async () => {
     token: token.value.trim(),
   };
   // Keep the paired device id while the paired token is left untouched.
-  if (loaded.deviceId && settings.token && settings.token === loaded.token) {
-    settings.deviceId = loaded.deviceId;
+  if (settings.token && settings.token === loaded.token) {
+    if (loaded.deviceId) settings.deviceId = loaded.deviceId;
+    if (loaded.paired) settings.paired = true;
   }
 
   await chrome.storage.local.set({ [REMOTE_SETTINGS_KEY]: settings });

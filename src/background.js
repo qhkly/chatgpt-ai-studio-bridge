@@ -20,6 +20,8 @@ const REMOTE_SETTINGS_KEY = 'remoteRelay';
 const RECENT_EVENTS_KEY = 'recentEventIds';
 const ROUTE_BINDINGS_KEY = 'routeBindings';
 const RECONNECT_MS = 3000;
+// Relay close code for a revoked / unknown device token.
+const REMOTE_REVOKED_CLOSE_CODE = 4003;
 const PING_MS = 20000;
 const MAX_RECENT_EVENTS = 100;
 const MAX_ROUTE_BINDINGS = 300;
@@ -38,6 +40,9 @@ let remoteSocketConfig = null;
 // Bumped by every restart so a connect that was still reading settings when
 // the settings changed cannot open a second, orphaned socket.
 let remoteGeneration = 0;
+// Connection key the relay revoked. A manually configured token is not wiped
+// from storage, but it is not retried either until the settings change.
+let remoteRevokedConfig = null;
 let localReconnectTimer = null;
 let remoteReconnectTimer = null;
 let localPingTimer = null;
@@ -344,6 +349,11 @@ const parseBridgeMessage = async (raw, source) => {
     return;
   }
   if (event?.type === 'pong') return;
+  if (event?.type === 'device.revoked') {
+    // Control frame, never a completion. Only the relay may revoke.
+    if (source === 'remote') await handleRemoteRevoked();
+    return;
+  }
   if (event?.type === 'extension.reload') {
     // AI Studio swapped the unpacked extension directory; pick it up without a
     // manual reload on chrome://extensions. Reload unconditionally on local
@@ -449,6 +459,7 @@ const connectRemoteBridge = async () => {
   const settings = await getRemoteSettings();
   if (generation !== remoteGeneration || remoteSocket) return;
   if (!settings.enabled || !settings.url || !settings.token) return;
+  if (remoteConfigKey(settings) === remoteRevokedConfig) return;
 
   let url;
   try {
@@ -467,9 +478,13 @@ const connectRemoteBridge = async () => {
   socket.addEventListener('message', (message) => {
     parseBridgeMessage(message.data, 'remote').catch(console.error);
   });
-  socket.addEventListener('close', () => {
+  socket.addEventListener('close', (event) => {
     // A socket replaced by restartRemoteBridge must not clobber its successor.
     if (remoteSocket !== socket) return;
+    if (event?.code === REMOTE_REVOKED_CLOSE_CODE) {
+      handleRemoteRevoked().catch(console.error);
+      return;
+    }
     if (remotePingTimer) clearInterval(remotePingTimer);
     remotePingTimer = null;
     remoteSocket = null;
@@ -493,6 +508,37 @@ const restartRemoteBridge = () => {
   socket?.close();
 
   connectRemoteBridge().catch(console.error);
+};
+
+// The relay revoked this device (device.revoked frame or close 4003): stop
+// the socket and every retry. A paired device token is useless from now on,
+// so it is forgotten and the popup offers pairing again; a manual token is
+// left in storage for the user to fix in 高级设置, but is not retried.
+const handleRemoteRevoked = async () => {
+  remoteGeneration++;
+  clearTimer(remoteReconnectTimer);
+  remoteReconnectTimer = null;
+  if (remotePingTimer) clearInterval(remotePingTimer);
+  remotePingTimer = null;
+
+  const socket = remoteSocket;
+  remoteSocket = null;
+  remoteSocketConfig = null;
+  socket?.close();
+
+  const current = await getRemoteSettings();
+  remoteRevokedConfig = remoteConfigKey(current);
+  console.warn('[AI Studio Bridge] Remote relay device revoked');
+
+  if (!current.paired && !current.deviceId) return;
+  // enabled:false makes the storage.onChanged restart a no-op connect.
+  await chrome.storage.local.set({
+    [REMOTE_SETTINGS_KEY]: {
+      enabled: false,
+      url: current.url || DEFAULT_REMOTE_RELAY_URL,
+      token: '',
+    },
+  });
 };
 
 // Popup "连接远程 AI Studio": claim the 6-digit code here in the worker so the
@@ -564,7 +610,8 @@ const getStatusSnapshot = async (tabId) => {
       since: localBridgeSince,
     },
     remoteRelay: {
-      enabled: Boolean(remote.enabled && remote.url && remote.token),
+      enabled: Boolean(remote.enabled && remote.url && remote.token) &&
+        remoteConfigKey(remote) !== remoteRevokedConfig,
       connected: socketState(remoteSocket) === 'connected',
     },
     tab,

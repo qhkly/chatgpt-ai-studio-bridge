@@ -79,6 +79,7 @@ test('pairing stores the device token and starts the remote relay immediately', 
       enabled: true,
       url: 'https://notify.qhkly.com',
       token: TOKEN,
+      paired: true,
       deviceId: 'dev-42',
     });
 
@@ -181,3 +182,148 @@ test('local and remote copies of one completion are delivered once', withBackgro
   assert.deepEqual(delivered, ['evt-dup']);
   assert.ok(remote.sent.some((raw) => JSON.parse(raw).type === 'ack'), 'remote copy still ACKed');
 }));
+
+// --- Revocation ---------------------------------------------------------------
+
+const PAIRED_SETTINGS = {
+  enabled: true,
+  url: 'https://notify.qhkly.com',
+  token: TOKEN,
+  paired: true,
+  deviceId: 'dev-42',
+};
+const MANUAL_SETTINGS = { enabled: true, url: 'https://notify.qhkly.com', token: 'manual-token' };
+const CLEARED = { enabled: false, url: 'https://notify.qhkly.com', token: '' };
+
+const revocationWorld = (remoteRelay, run) => withBackground({
+  local: { remoteRelay },
+  emitStorageChanges: true,
+}, async (world, logs) => {
+  await flush();
+  const [socket] = remoteSockets(world);
+  socket.open();
+  await run(world, socket, logs);
+});
+
+const assertStaysDown = async (world) => {
+  world.runTimers();
+  await flush();
+  world.runTimers();
+  await flush();
+  assert.equal(remoteSockets(world).length, 1, 'no reconnect after revocation');
+};
+
+test('a device.revoked frame forgets the paired token and stops reconnecting', revocationWorld(
+  PAIRED_SETTINGS,
+  async (world, socket, logs) => {
+    const delivered = [];
+    world.tabHandlers.set(7, (message) => {
+      if (message.type === 'aiStudio.taskCompleted') delivered.push(message);
+      return { ok: true };
+    });
+
+    socket._fire('message', { data: JSON.stringify({ type: 'device.revoked' }) });
+    await flush();
+
+    assert.deepEqual(world.chrome.storage.local.data.remoteRelay, CLEARED);
+    assert.equal(socket.readyState, 3, 'socket closed');
+    assert.equal(delivered.length, 0, 'control frame is not a completion');
+    assert.ok(!socket.sent.some((raw) => JSON.parse(raw).type === 'ack'));
+    await assertStaysDown(world);
+
+    const snapshot = await world.popup('aiStudio.popup.getStatus', 7);
+    assert.deepEqual(snapshot.remoteRelay, { enabled: false, connected: false });
+    for (const text of [JSON.stringify(snapshot), formatDiagnostics(snapshot), logs.text()]) {
+      assert.ok(!text.includes(TOKEN), 'device token leaked');
+    }
+  },
+));
+
+test('close code 4003 is treated as a revoked device', revocationWorld(
+  PAIRED_SETTINGS,
+  async (world, socket) => {
+    socket.serverClose(4003);
+    await flush();
+
+    assert.deepEqual(world.chrome.storage.local.data.remoteRelay, CLEARED);
+    await assertStaysDown(world);
+  },
+));
+
+test('a device paired without deviceId is still recognized by the paired flag', revocationWorld(
+  { enabled: true, url: 'https://notify.qhkly.com', token: TOKEN, paired: true },
+  async (world, socket) => {
+    socket.serverClose(4003);
+    await flush();
+    assert.deepEqual(world.chrome.storage.local.data.remoteRelay, CLEARED);
+  },
+));
+
+test('a revoked manual token is kept in settings but not retried', revocationWorld(
+  MANUAL_SETTINGS,
+  async (world, socket) => {
+    socket.serverClose(4003);
+    await flush();
+
+    assert.deepEqual(world.chrome.storage.local.data.remoteRelay, MANUAL_SETTINGS);
+    await assertStaysDown(world);
+    const snapshot = await world.popup('aiStudio.popup.getStatus', 7);
+    assert.equal(snapshot.remoteRelay.enabled, false, 'popup offers re-pairing');
+
+    // Re-writing the same revoked token does not start hammering the relay.
+    await world.chrome.storage.local.set({ remoteRelay: { ...MANUAL_SETTINGS } });
+    await flush();
+    assert.equal(remoteSockets(world).length, 1, 'same revoked token not retried');
+
+    // Fixing the token in 高级设置 connects again.
+    await world.chrome.storage.local.set({ remoteRelay: { ...MANUAL_SETTINGS, token: 'fixed-token' } });
+    await flush();
+    assert.equal(remoteSockets(world).length, 2);
+    assert.match(remoteSockets(world)[1].url, /token=fixed-token$/);
+  },
+));
+
+test('a plain network close keeps the settings and reconnects', async () => {
+  for (const settings of [PAIRED_SETTINGS, MANUAL_SETTINGS]) {
+    await revocationWorld(settings, async (world, socket) => {
+      socket.serverClose(1006);
+      await flush();
+
+      assert.deepEqual(world.chrome.storage.local.data.remoteRelay, settings);
+      world.runTimers();
+      await flush();
+      const sockets = remoteSockets(world);
+      assert.equal(sockets.length, 2, 'reconnected');
+      assert.equal(sockets[1].url, socket.url);
+    })();
+  }
+});
+
+test('device.revoked from the local bridge is ignored', revocationWorld(
+  PAIRED_SETTINGS,
+  async (world, socket) => {
+    world.localSocket()._fire('message', { data: JSON.stringify({ type: 'device.revoked' }) });
+    await flush();
+    assert.deepEqual(world.chrome.storage.local.data.remoteRelay, PAIRED_SETTINGS);
+    assert.equal(socket.readyState, 1);
+  },
+));
+
+test('re-pairing after revocation connects with the new token', async () => {
+  const fresh = { ...PAIRED, deviceToken: 'second-token', deviceId: 'dev-43' };
+  await withBackground({
+    local: { remoteRelay: PAIRED_SETTINGS },
+    emitStorageChanges: true,
+    fetch: fetchReturning(claimResponse(200, fresh)),
+  }, async (world) => {
+    await flush();
+    remoteSockets(world)[0].serverClose(4003);
+    await flush();
+
+    assert.deepEqual(await pair(world, '654321'), { ok: true });
+    await flush();
+    const sockets = remoteSockets(world);
+    assert.equal(sockets.length, 2, 'exactly one new socket despite onChanged');
+    assert.match(sockets[1].url, /token=second-token$/);
+  })();
+});
