@@ -1,3 +1,4 @@
+import { createBadgeState } from './badge.js';
 import {
   DEFAULT_BRIDGE_URL,
   buildCompletionPrompt,
@@ -24,6 +25,10 @@ let localPingTimer = null;
 let remotePingTimer = null;
 let deliveryQueue = Promise.resolve();
 const pendingRouteIds = new Set();
+
+// "ON" only ever claims route registration. A send-injection failure latches
+// "!" until an injection succeeds again, even across re-registrations.
+const badgeState = createBadgeState();
 
 const setBadge = async (text) => {
   await chrome.action.setBadgeText({ text });
@@ -62,7 +67,7 @@ const saveRouteBinding = async (routeId, tabId) => {
   };
 
   await chrome.storage.local.set({ [ROUTE_BINDINGS_KEY]: next });
-  await setBadge('ON');
+  await setBadge(badgeState.onRouteRegistered());
 
   // Recycle the relay only when an unmatched completion is actually waiting
   // for this exact route. Normal ChatGPT traffic must not churn the socket.
@@ -408,6 +413,26 @@ const restartRemoteBridge = () => {
 
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'aiStudio.routeInjectFailed') {
+    console.warn(
+      '[AI Studio Bridge] Route marker injection failed',
+      { routeId: message.routeId, detail: message.detail, url: message.url },
+    );
+    setBadge(badgeState.onInjectFailed()).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message?.type === 'aiStudio.routeInjectRecovered') {
+    console.info(
+      '[AI Studio Bridge] Route marker injection recovered',
+      { routeId: message.routeId, url: message.url },
+    );
+    setBadge(badgeState.onInjectRecovered()).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type !== 'aiStudio.routeRegistered') return undefined;
 
   const routeId = routeIdFromRequestId(message.routeId);
