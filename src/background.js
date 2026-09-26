@@ -1,6 +1,8 @@
 import { createBadgeState } from './badge.js';
+import { claimPairing } from './pairing.js';
 import {
   DEFAULT_BRIDGE_URL,
+  DEFAULT_REMOTE_RELAY_URL,
   buildCompletionPrompt,
   buildRemoteWebSocketUrl,
   eventKey,
@@ -30,6 +32,12 @@ const LAST_REDETECTS_KEY = 'lastRedetects';
 
 let localSocket = null;
 let remoteSocket = null;
+// url + token the current remote socket was opened with, so a storage write
+// that restates the same connection does not recycle a live socket.
+let remoteSocketConfig = null;
+// Bumped by every restart so a connect that was still reading settings when
+// the settings changed cannot open a second, orphaned socket.
+let remoteGeneration = 0;
 let localReconnectTimer = null;
 let remoteReconnectTimer = null;
 let localPingTimer = null;
@@ -406,6 +414,11 @@ const connectLocalBridge = () => {
   localSocket.addEventListener('error', () => localSocket?.close());
 };
 
+const remoteConfigKey = (settings) =>
+  settings?.enabled && settings.url && settings.token
+    ? settings.url + '\n' + settings.token
+    : null;
+
 const getRemoteSettings = async () => {
   const stored = await chrome.storage.local.get(REMOTE_SETTINGS_KEY);
   return stored[REMOTE_SETTINGS_KEY] ?? {
@@ -432,33 +445,42 @@ const connectRemoteBridge = async () => {
     return;
   }
 
+  const generation = remoteGeneration;
   const settings = await getRemoteSettings();
+  if (generation !== remoteGeneration || remoteSocket) return;
   if (!settings.enabled || !settings.url || !settings.token) return;
 
   let url;
   try {
     url = buildRemoteWebSocketUrl(settings.url, settings.token);
-  } catch (error) {
-    console.error('[AI Studio Bridge] Invalid remote relay URL', error);
+  } catch {
+    // The error text would echo the URL; the token is never logged.
+    console.error('[AI Studio Bridge] Invalid remote relay URL');
     return;
   }
 
-  remoteSocket = new WebSocket(url);
+  const socket = new WebSocket(url);
+  remoteSocket = socket;
+  remoteSocketConfig = remoteConfigKey(settings);
 
-  remoteSocket.addEventListener('open', () => startPing('remote'));
-  remoteSocket.addEventListener('message', (message) => {
+  socket.addEventListener('open', () => startPing('remote'));
+  socket.addEventListener('message', (message) => {
     parseBridgeMessage(message.data, 'remote').catch(console.error);
   });
-  remoteSocket.addEventListener('close', () => {
+  socket.addEventListener('close', () => {
+    // A socket replaced by restartRemoteBridge must not clobber its successor.
+    if (remoteSocket !== socket) return;
     if (remotePingTimer) clearInterval(remotePingTimer);
     remotePingTimer = null;
     remoteSocket = null;
+    remoteSocketConfig = null;
     scheduleRemoteReconnect();
   });
-  remoteSocket.addEventListener('error', () => remoteSocket?.close());
+  socket.addEventListener('error', () => socket.close());
 };
 
 const restartRemoteBridge = () => {
+  remoteGeneration++;
   clearTimer(remoteReconnectTimer);
   remoteReconnectTimer = null;
 
@@ -467,11 +489,42 @@ const restartRemoteBridge = () => {
 
   const socket = remoteSocket;
   remoteSocket = null;
+  remoteSocketConfig = null;
   socket?.close();
 
   connectRemoteBridge().catch(console.error);
 };
 
+// Popup "连接远程 AI Studio": claim the 6-digit code here in the worker so the
+// device token never reaches the popup. The response to the popup is
+// token-free on purpose.
+const pairRemoteRelay = async (code) => {
+  const current = await getRemoteSettings();
+  const result = await claimPairing({
+    code,
+    relayBase: current.url || DEFAULT_REMOTE_RELAY_URL,
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+
+  await chrome.storage.local.set({ [REMOTE_SETTINGS_KEY]: result.settings });
+  restartRemoteBridge();
+  return { ok: true };
+};
+
+// Forgets this browser's device token only. The server-side device stays
+// registered until it is revoked from AI Studio's device list.
+const disconnectRemoteRelay = async () => {
+  const current = await getRemoteSettings();
+  await chrome.storage.local.set({
+    [REMOTE_SETTINGS_KEY]: {
+      enabled: false,
+      url: current.url || DEFAULT_REMOTE_RELAY_URL,
+      token: '',
+    },
+  });
+  restartRemoteBridge();
+  return { ok: true };
+};
 
 const socketState = (socket) => {
   if (socket?.readyState === WebSocket.OPEN) return 'connected';
@@ -602,6 +655,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
   }
 
+  if (message?.type === 'aiStudio.popup.pairRemote' && !sender.tab) {
+    return respondAsync(
+      pairRemoteRelay(message.code),
+      sendResponse,
+      { ok: false, reason: 'internal-error' },
+    );
+  }
+
+  if (message?.type === 'aiStudio.popup.disconnectRemote' && !sender.tab) {
+    return respondAsync(disconnectRemoteRelay(), sendResponse, { ok: false });
+  }
+
   if (message?.type === 'aiStudio.routeInjectOutcome') {
     const tabId = sender.tab?.id;
     if (!Number.isInteger(tabId) || tabId < 0) {
@@ -692,6 +757,9 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && changes[REMOTE_SETTINGS_KEY]) {
+    const next = remoteConfigKey(changes[REMOTE_SETTINGS_KEY].newValue);
+    // Pairing already restarted the socket with exactly these settings.
+    if (next && next === remoteSocketConfig && remoteSocket) return;
     restartRemoteBridge();
   }
 });

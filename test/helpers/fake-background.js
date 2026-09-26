@@ -63,6 +63,9 @@ export const setupBackground = async ({
   version = '9.9.9',
   local = {},
   tabs = [],
+  fetch = async () => {
+    throw new TypeError('Failed to fetch');
+  },
 } = {}) => {
   FakeWebSocket.instances = [];
 
@@ -125,6 +128,7 @@ export const setupBackground = async ({
   const noop = () => 0;
   const globals = {
     chrome,
+    fetch,
     WebSocket: FakeWebSocket,
     setTimeout: noop,
     clearTimeout: noop,

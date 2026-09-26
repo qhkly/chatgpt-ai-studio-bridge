@@ -8,9 +8,12 @@ const token = document.querySelector('#token');
 const save = document.querySelector('#save');
 const status = document.querySelector('#status');
 
+let loaded = {};
+
 const load = async () => {
   const stored = await chrome.storage.local.get(REMOTE_SETTINGS_KEY);
   const settings = stored[REMOTE_SETTINGS_KEY] ?? {};
+  loaded = settings;
 
   enabled.checked = settings.enabled ?? false;
   url.value = settings.url || DEFAULT_REMOTE_RELAY_URL;
@@ -23,8 +26,13 @@ save.addEventListener('click', async () => {
     url: url.value.trim() || DEFAULT_REMOTE_RELAY_URL,
     token: token.value.trim(),
   };
+  // Keep the paired device id while the paired token is left untouched.
+  if (loaded.deviceId && settings.token && settings.token === loaded.token) {
+    settings.deviceId = loaded.deviceId;
+  }
 
   await chrome.storage.local.set({ [REMOTE_SETTINGS_KEY]: settings });
+  loaded = settings;
   status.textContent = '已保存';
   setTimeout(() => {
     status.textContent = '';
