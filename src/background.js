@@ -7,6 +7,11 @@ import {
   isTaskCompletedEvent,
   routeIdFromRequestId,
 } from './protocol.js';
+import {
+  buildStatusSnapshot,
+  findTabRouteBinding,
+  normalizeInjectionOutcome,
+} from './status.js';
 
 const REMOTE_SETTINGS_KEY = 'remoteRelay';
 const RECENT_EVENTS_KEY = 'recentEventIds';
@@ -16,6 +21,10 @@ const PING_MS = 20000;
 const MAX_RECENT_EVENTS = 100;
 const MAX_ROUTE_BINDINGS = 300;
 const ROUTE_TTL_MS = 24 * 60 * 60 * 1000;
+// Popup status lives in chrome.storage.session: it survives service-worker
+// restarts but not a browser restart, and content scripts cannot read it.
+const INJECTION_OUTCOMES_KEY = 'injectionOutcomes';
+const LAST_DELIVERY_KEY = 'lastDelivery';
 
 let localSocket = null;
 let remoteSocket = null;
@@ -25,6 +34,8 @@ let localPingTimer = null;
 let remotePingTimer = null;
 let deliveryQueue = Promise.resolve();
 const pendingRouteIds = new Set();
+let localBridgeSince = null;
+let sessionWrites = Promise.resolve();
 
 // "ON" only ever claims route registration. A send-injection failure latches
 // "!" until an injection succeeds again, even across re-registrations.
@@ -35,6 +46,39 @@ const setBadge = async (text) => {
 };
 
 const isChatGptUrl = (url = '') => url.startsWith('https://chatgpt.com/');
+
+// Serialized read-modify-write so concurrent reports never drop each other,
+// and so a status read observes every report received before it.
+const updateSession = (key, update) => {
+  sessionWrites = sessionWrites
+    .then(async () => {
+      const stored = await chrome.storage.session.get(key);
+      await chrome.storage.session.set({ [key]: update(stored[key]) });
+    })
+    .catch((error) => {
+      console.error('[AI Studio Bridge] Failed to update status', error);
+    });
+  return sessionWrites;
+};
+
+const readSession = async (key) => {
+  await sessionWrites;
+  const stored = await chrome.storage.session.get(key);
+  return stored[key];
+};
+
+const recordInjectionOutcome = (tabId, outcome) =>
+  updateSession(INJECTION_OUTCOMES_KEY, (current) => ({
+    ...(current ?? {}),
+    [tabId]: outcome,
+  }));
+
+const recordDelivery = (outcome, routeId) =>
+  updateSession(LAST_DELIVERY_KEY, () => ({
+    outcome,
+    routeId,
+    at: Date.now(),
+  }));
 
 const getRouteBindings = async () => {
   const stored = await chrome.storage.local.get(ROUTE_BINDINGS_KEY);
@@ -131,26 +175,31 @@ const deliverCompletion = async (event) => {
 
   if (!tab?.id) {
     console.warn('[AI Studio Bridge] No ChatGPT tab matches route', event.routeId);
+    await recordDelivery('unmatched', event.routeId);
     await setBadge('!');
     return 'unmatched';
   }
 
   if (!(await ensureContentScript(tab.id))) {
+    await recordDelivery('content-script-unavailable', event.routeId);
     await setBadge('!');
     return 'failed';
   }
 
+  let outcome;
   try {
     const result = await chrome.tabs.sendMessage(tab.id, {
       type: 'aiStudio.taskCompleted',
       prompt: buildCompletionPrompt(event),
       event,
     });
-    return result?.ok === true ? 'delivered' : 'failed';
+    outcome = result?.ok === true ? 'delivered' : 'failed';
   } catch (error) {
     console.error('[AI Studio Bridge] Failed to deliver completion event', error);
-    return 'failed';
+    outcome = 'failed';
   }
+  await recordDelivery(outcome, event.routeId);
+  return outcome;
 };
 
 const hasDelivered = async (key) => {
@@ -332,11 +381,15 @@ const connectLocalBridge = () => {
 
   localSocket = new WebSocket(DEFAULT_BRIDGE_URL);
 
-  localSocket.addEventListener('open', () => startPing('local'));
+  localSocket.addEventListener('open', () => {
+    localBridgeSince = Date.now();
+    startPing('local');
+  });
   localSocket.addEventListener('message', (message) => {
     parseBridgeMessage(message.data, 'local').catch(console.error);
   });
   localSocket.addEventListener('close', () => {
+    localBridgeSince = null;
     if (localPingTimer) clearInterval(localPingTimer);
     localPingTimer = null;
     localSocket = null;
@@ -412,7 +465,131 @@ const restartRemoteBridge = () => {
 };
 
 
+const socketState = (socket) => {
+  if (socket?.readyState === WebSocket.OPEN) return 'connected';
+  if (socket?.readyState === WebSocket.CONNECTING) return 'connecting';
+  return 'disconnected';
+};
+
+const getTabOrNull = async (tabId) => {
+  if (!Number.isInteger(tabId) || tabId < 0) return null;
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch {
+    return null;
+  }
+};
+
+// Real state only: socket readyState, the exact routeBindings entry for this
+// tab, and the last injection report the tab's content script sent. The
+// badge text is included for diagnostics but never used to derive status.
+const getStatusSnapshot = async (tabId) => {
+  const now = Date.now();
+  const tab = await getTabOrNull(tabId);
+  const [bindings, outcomes, lastDelivery, remote, badge] = await Promise.all([
+    getRouteBindings(),
+    readSession(INJECTION_OUTCOMES_KEY),
+    readSession(LAST_DELIVERY_KEY),
+    getRemoteSettings(),
+    chrome.action.getBadgeText({}).catch(() => ''),
+  ]);
+
+  return buildStatusSnapshot({
+    version: chrome.runtime.getManifest().version,
+    now,
+    localBridge: {
+      state: socketState(localSocket),
+      since: localBridgeSince,
+    },
+    remoteRelay: {
+      enabled: Boolean(remote.enabled && remote.url && remote.token),
+      connected: socketState(remoteSocket) === 'connected',
+    },
+    tab,
+    routeBinding: findTabRouteBinding(bindings, tab, now, ROUTE_TTL_MS),
+    injection: tab ? outcomes?.[tab.id] ?? null : null,
+    lastDelivery: lastDelivery ?? null,
+    badge,
+  });
+};
+
+// Replaces the old action.onClicked re-registration (a default_popup
+// suppresses onClicked). Re-registers the tab's route and asks the page for a
+// non-destructive injection probe; the probe's own outcome is recorded here
+// too so the popup's next snapshot cannot race the content-script report.
+const redetectTab = async (tabId) => {
+  const tab = await getTabOrNull(tabId);
+  if (!tab) return { ok: false, reason: 'tab-not-found' };
+  if (!isChatGptUrl(tab.url)) return { ok: false, reason: 'not-chatgpt' };
+  if (!(await ensureContentScript(tab.id))) {
+    return { ok: false, reason: 'content-script-unavailable' };
+  }
+
+  let response;
+  try {
+    response = await chrome.tabs.sendMessage(tab.id, {
+      type: 'aiStudio.requestRouteRegistration',
+      probe: true,
+    });
+  } catch (error) {
+    console.error('[AI Studio Bridge] Failed to request route registration', error);
+    return { ok: false, reason: 'registration-request-failed' };
+  }
+
+  const probe = response?.probe;
+  if (probe?.outcome) {
+    await recordInjectionOutcome(
+      tab.id,
+      normalizeInjectionOutcome(probe.outcome, tab.url, Date.now()),
+    );
+  }
+
+  return {
+    ok: response?.ok === true,
+    reason: response?.ok === true ? null : 'registration-failed',
+    probe: probe
+      ? { status: String(probe.status), detail: probe.detail ?? null }
+      : { status: 'unsupported', detail: null },
+  };
+};
+
+const respondAsync = (promise, sendResponse, fallback) => {
+  promise
+    .then(sendResponse)
+    .catch((error) => {
+      console.error('[AI Studio Bridge] Popup request failed', error);
+      sendResponse(fallback);
+    });
+  return true;
+};
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Popup requests come from the extension page itself, never from a tab.
+  if (message?.type === 'aiStudio.popup.getStatus' && !sender.tab) {
+    return respondAsync(getStatusSnapshot(message.tabId), sendResponse, null);
+  }
+
+  if (message?.type === 'aiStudio.popup.redetect' && !sender.tab) {
+    return respondAsync(
+      redetectTab(message.tabId),
+      sendResponse,
+      { ok: false, reason: 'internal-error' },
+    );
+  }
+
+  if (message?.type === 'aiStudio.routeInjectOutcome') {
+    const tabId = sender.tab?.id;
+    if (!Number.isInteger(tabId) || tabId < 0) {
+      sendResponse({ ok: false });
+      return false;
+    }
+    recordInjectionOutcome(
+      tabId,
+      normalizeInjectionOutcome(message, sender.tab.url, Date.now()),
+    ).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
   if (message?.type === 'aiStudio.routeInjectFailed') {
     console.warn(
       '[AI Studio Bridge] Route marker injection failed',
@@ -451,19 +628,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-chrome.action.onClicked.addListener((tab) => {
-  if (!tab?.id || !isChatGptUrl(tab.url)) {
-    setBadge('!').catch(() => {});
-    return;
-  }
-  chrome.tabs.sendMessage(tab.id, { type: 'aiStudio.requestRouteRegistration' })
-    .catch((error) => {
-      console.error('[AI Studio Bridge] Failed to request route registration', error);
-      setBadge('!').catch(() => {});
-    });
-});
+// Declared content scripts only reach pages loaded after install/update.
+// Inject into ChatGPT tabs that were already open so they register their
+// route without a reload or a manual click.
+const registerOpenChatGptTabs = async () => {
+  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  await Promise.all(
+    tabs
+      .filter((tab) => Number.isInteger(tab.id))
+      .map((tab) => ensureContentScript(tab.id)),
+  );
+};
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  updateSession(INJECTION_OUTCOMES_KEY, (current) => {
+    const next = { ...(current ?? {}) };
+    delete next[tabId];
+    return next;
+  });
+
   const stored = await chrome.storage.local.get(ROUTE_BINDINGS_KEY);
   const routes = stored[ROUTE_BINDINGS_KEY] ?? {};
   let changed = false;
@@ -490,6 +673,7 @@ chrome.runtime.onInstalled.addListener(() => {
   setBadge('').catch(() => {});
   connectLocalBridge();
   connectRemoteBridge().catch(console.error);
+  registerOpenChatGptTabs().catch(console.error);
 });
 
 chrome.runtime.onStartup.addListener(() => {

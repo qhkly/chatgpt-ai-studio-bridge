@@ -137,18 +137,21 @@ const getOrCreateRouteId = () => {
   return routeId;
 };
 
-const registerRoute = (routeId) => {
-  chrome.runtime.sendMessage(
-    {
-      type: 'aiStudio.routeRegistered',
-      routeId,
-      url: location.href,
-    },
-    () => {
-      void chrome.runtime.lastError;
-    },
-  );
-};
+// Resolves true once the background has persisted the binding.
+const registerRoute = (routeId) =>
+  new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      {
+        type: 'aiStudio.routeRegistered',
+        routeId,
+        url: location.href,
+      },
+      (response) => {
+        void chrome.runtime.lastError;
+        resolve(response?.ok === true);
+      },
+    );
+  });
 
 const registerCurrentRoute = () => {
   const routeId = getOrCreateRouteId();
@@ -202,7 +205,19 @@ const sendRouteMessage = (message) => {
   });
 };
 
-const reportInjectionOutcome = (ok, routeId, detail) => {
+// Every outcome goes to the background (per-tab record behind the popup);
+// the failed/recovered pair below only drives the badge latch.
+const reportInjectionOutcome = (ok, routeId, detail, source = 'send') => {
+  sendRouteMessage({
+    type: 'aiStudio.routeInjectOutcome',
+    ok,
+    routeId,
+    detail: ok ? null : detail,
+    at: Date.now(),
+    url: location.href,
+    source,
+  });
+
   if (ok) {
     if (lastInjectionOk === false) {
       sendRouteMessage({
@@ -226,37 +241,98 @@ const reportInjectionOutcome = (ok, routeId, detail) => {
 // reading the composer text back. The composer is framework-controlled
 // (React textarea / Lexical contenteditable), so a DOM write can be silently
 // dropped — the read-back, not the write, is the source of truth.
-const injectRouteMarker = (composer, { reportMissingComposer = true } = {}) => {
+const injectRouteMarker = (
+  composer,
+  { reportMissingComposer = true, source = 'send' } = {},
+) => {
   if (!composer) {
     if (reportMissingComposer) {
-      reportInjectionOutcome(false, null, 'composer-not-found');
+      reportInjectionOutcome(false, null, 'composer-not-found', source);
     }
-    return { ok: false, routeId: null };
+    return { ok: false, routeId: null, detail: 'composer-not-found' };
   }
 
   const routeId = registerCurrentRoute();
 
   for (let attempt = 0; attempt < MARKER_INJECT_ATTEMPTS; attempt++) {
     if (markerVerified(composer, routeId)) {
-      reportInjectionOutcome(true, routeId);
+      reportInjectionOutcome(true, routeId, null, source);
       return { ok: true, routeId };
     }
 
     writePrompt(composer, buildTextWithMarker(composerRawText(composer), routeId));
 
     if (markerVerified(composer, routeId)) {
-      reportInjectionOutcome(true, routeId);
+      reportInjectionOutcome(true, routeId, null, source);
       return { ok: true, routeId };
     }
   }
 
   const found = routeMarkerIds(composerRawText(composer)).join(',') || 'none';
-  reportInjectionOutcome(
-    false,
-    routeId,
-    'readback-mismatch:composer=' + composer.tagName + ':markers=' + found,
-  );
-  return { ok: false, routeId };
+  const detail = 'readback-mismatch:composer=' + composer.tagName + ':markers=' + found;
+  reportInjectionOutcome(false, routeId, detail, source);
+  return { ok: false, routeId, detail };
+};
+
+// Popup "re-detect" capability check. It only runs on an EMPTY composer, so
+// there is no user text to damage, and it removes its own marker within the
+// same task (no await between write and cleanup), so neither the user nor an
+// automated send can observe the marker. A composer with text is never
+// touched: the probe is skipped and the injection state stays as it was.
+const clearComposer = (composer) => {
+  writePrompt(composer, '');
+  if (composerRawText(composer).trim() !== '') {
+    // Some editors ignore an empty insertText; delete the selection instead.
+    document.execCommand('delete');
+  }
+  return composerRawText(composer).trim() === '';
+};
+
+// Text the user could have typed, i.e. anything besides route markers
+// (current Markdown format or legacy HTML comments).
+const nonMarkerText = (composer) =>
+  composerRawText(composer)
+    .replace(ROUTE_MARKER_RE, '')
+    .replace(LEGACY_ROUTE_MARKER_RE, '')
+    .trim();
+
+const probeInjection = async () => {
+  const composer = findComposer();
+  if (!composer) return { status: 'skipped', detail: 'composer-not-found' };
+  if (composerRawText(composer).trim() !== '') {
+    return { status: 'skipped', detail: 'composer-has-text' };
+  }
+
+  const result = injectRouteMarker(composer, { source: 'probe' });
+  const cleaned = clearComposer(composer);
+
+  // Catch a framework re-render that resurrects the probe marker; only a
+  // composer holding nothing but markers is cleared again.
+  await sleep(MARKER_SETTLE_MS);
+  const residue = composerRawText(composer).trim() !== '';
+  const stillClean = cleaned && (!residue ||
+    (nonMarkerText(composer) === '' && clearComposer(composer)));
+
+  if (!stillClean) {
+    const detail = 'probe-cleanup-failed';
+    reportInjectionOutcome(false, result.routeId, detail, 'probe');
+    return {
+      status: 'failed',
+      detail,
+      outcome: { ok: false, routeId: result.routeId, detail, source: 'probe' },
+    };
+  }
+
+  return {
+    status: result.ok ? 'ok' : 'failed',
+    detail: result.ok ? null : result.detail,
+    outcome: {
+      ok: result.ok,
+      routeId: result.routeId,
+      detail: result.ok ? null : result.detail,
+      source: 'probe',
+    },
+  };
 };
 
 // Variant for automated sends, which can wait one render cycle: verify again
@@ -405,9 +481,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === 'aiStudio.requestRouteRegistration') {
-    registerCurrentRoute();
-    sendResponse({ ok: true });
-    return false;
+    const routeId = getOrCreateRouteId();
+    registerRoute(routeId)
+      .then(async (registered) => ({
+        ok: registered,
+        routeId,
+        probe: message.probe === true ? await probeInjection() : null,
+      }))
+      .then(sendResponse)
+      .catch((error) => {
+        console.error('[AI Studio Bridge] Re-detection failed', error);
+        sendResponse({ ok: false, routeId });
+      });
+    return true;
   }
 
   if (message?.type !== 'aiStudio.taskCompleted') return undefined;

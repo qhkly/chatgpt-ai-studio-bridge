@@ -64,6 +64,13 @@ test('resolveRuntimeFiles covers manifest references and walked imports', async 
   assert.ok(files.includes('src/background.js'));
   assert.ok(files.includes('src/content.js'));
   assert.ok(files.includes('src/options.js'));
+  // The popup is reached through action.default_popup → popup.html, whose
+  // stylesheet/script refs and the script's imports are walked.
+  assert.equal(MANIFEST.action.default_popup, 'popup.html');
+  assert.ok(files.includes('popup.html'));
+  assert.ok(files.includes('popup.css'));
+  assert.ok(files.includes('src/popup.js'));
+  assert.ok(files.includes('src/status.js'));
   // protocol.js is never listed in the manifest — it must come from the import walk.
   assert.ok(files.includes('src/protocol.js'));
   assert.deepEqual(
@@ -95,6 +102,28 @@ test('packaged zip has manifest.json at its root and a matching sha256', async (
   // sha256File must match an independent shell recomputation.
   const direct = (await execFileAsync('shasum', ['-a', '256', zipPath])).stdout.split(' ')[0];
   assert.equal(await sha256File(zipPath), direct);
+});
+
+test('every local src/href/import of every packaged file is itself packaged', async () => {
+  const workDir = await makeTmpDir();
+  const stagingDir = path.join(workDir, 'staging');
+  const zipPath = path.join(workDir, RELEASE_ZIP_NAME);
+
+  const files = await stageRuntimeFiles(ROOT, stagingDir, MANIFEST);
+  await createZip(stagingDir, zipPath, files);
+  const entries = new Set(await listZipEntries(zipPath));
+
+  assert.ok(entries.has(MANIFEST.action.default_popup), 'default_popup is in the ZIP');
+
+  const refPattern = /(?:src|href)\s*=\s*(['"])([^'"#:]+)\1|from\s*(['"])(\.[^'"]+)\3/g;
+  for (const file of files.filter((name) => /\.(html|js)$/.test(name))) {
+    const source = await readFile(path.join(ROOT, file), 'utf8');
+    for (const match of source.matchAll(refPattern)) {
+      const ref = match[2] ?? match[4];
+      const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), ref));
+      assert.ok(entries.has(resolved), `${file} references ${ref}, missing from ZIP`);
+    }
+  }
 });
 
 test('buildVersionMetadata and download URL shape', () => {

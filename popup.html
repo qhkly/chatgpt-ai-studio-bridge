@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>AI Studio Bridge 状态</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>AI Studio → ChatGPT Bridge</header>
+
+  <ul id="rows" aria-live="polite"></ul>
+  <p id="delivery" class="note" hidden></p>
+
+  <div class="actions">
+    <button id="redetect" type="button">重新检测当前页面</button>
+    <button id="copy" type="button">复制诊断信息</button>
+  </div>
+  <p id="message" class="note" hidden></p>
+
+  <script type="module" src="src/popup.js"></script>
+</body>
+</html>

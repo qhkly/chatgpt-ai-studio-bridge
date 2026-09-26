@@ -40,6 +40,7 @@ const manifestReferencedPaths = (manifest) => {
 
   Object.values(manifest.icons ?? {}).forEach(add);
   Object.values(manifest.action?.default_icon ?? {}).forEach(add);
+  add(manifest.action?.default_popup);
   add(manifest.background?.service_worker);
   add(manifest.options_page ?? manifest.options_ui?.page);
   for (const script of manifest.content_scripts ?? []) {
@@ -78,8 +79,8 @@ const collectHtmlRefs = (source) => {
 /**
  * Runtime files = manifest.json + everything the manifest references, then a
  * transitive walk: ESM imports from .js files (protocol.js is reached this
- * way) and src/href references from .html files (options.js is reached this
- * way).
+ * way) and src/href references from .html files (options.js, popup.css and
+ * popup.js are reached this way).
  */
 export const resolveRuntimeFiles = async (root, manifest) => {
   const files = new Set(['manifest.json', ...manifestReferencedPaths(manifest)]);

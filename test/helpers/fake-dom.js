@@ -182,7 +182,7 @@ const createWorld = ({ execCommand } = {}) => {
       lastError: null,
       sendMessage: (message, callback) => {
         sentMessages.push(message);
-        callback?.();
+        callback?.(world.respondToMessage(message));
       },
       onMessage: {
         addListener: (listener) => messageListeners.push(listener),
@@ -198,6 +198,9 @@ const createWorld = ({ execCommand } = {}) => {
     messageListeners,
     conversationId: CONVERSATION_ID,
     routeId: null,
+    // What the background answers; route registrations succeed by default.
+    respondToMessage: (message) =>
+      message.type === 'aiStudio.routeRegistered' ? { ok: true } : undefined,
   };
 
   const globals = {
@@ -364,6 +367,17 @@ export const sendTaskCompleted = async (world, prompt) => {
     if (async !== true) resolve(undefined);
   });
 };
+
+// Delivers any background → content message and resolves with the
+// content script's response (sync or async).
+export const sendToContent = (world, message) =>
+  new Promise((resolve) => {
+    for (const listener of world.messageListeners) {
+      const async = listener(message, {}, resolve);
+      if (async === true) return;
+    }
+    resolve(undefined);
+  });
 
 export const withPage = async (options, run) => {
   const world = setupPage(options);
