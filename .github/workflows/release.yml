@@ -1,0 +1,43 @@
+# Publishing happens only when a v*.*.* tag is pushed. The tag (minus the
+# leading v) must equal manifest.json's version exactly — scripts/release
+# fails the build otherwise, before any artifact exists. There is deliberately
+# no "latest" tag and no latest/version.json asset: consumers find the newest
+# official build through the GitHub Releases latest API.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm test
+
+      - name: Package extension
+        run: >
+          node scripts/release/package.mjs
+          --tag "${GITHUB_REF_NAME}"
+          --repo "${GITHUB_REPOSITORY}"
+          --out dist/release
+
+      - name: Create or update the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/release/chatgpt-ai-studio-bridge.zip
+            dist/release/version.json

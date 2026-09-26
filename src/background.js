@@ -276,12 +276,10 @@ const parseBridgeMessage = async (raw, source) => {
   if (event?.type === 'pong') return;
   if (event?.type === 'extension.reload') {
     // AI Studio swapped the unpacked extension directory; pick it up without a
-    // manual reload on chrome://extensions. Skip when the version is unchanged
-    // so a stale broadcast cannot reload-loop the service worker.
-    if (
-      source === 'local' &&
-      (!event.version || event.version !== chrome.runtime.getManifest().version)
-    ) {
+    // manual reload on chrome://extensions. Reload unconditionally on local
+    // broadcasts — the upgrade identity is the GitHub Release behind the swap,
+    // not the manifest version.
+    if (source === 'local') {
       chrome.runtime.reload();
     }
     return;
