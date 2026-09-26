@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Studio → ChatGPT Bridge",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Route WebCode AI Studio worker completion events back to the ChatGPT conversation that created them.",
   "minimum_chrome_version": "116",
   "permissions": [
