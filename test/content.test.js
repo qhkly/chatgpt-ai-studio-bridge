@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   composerTextOf,
   dispatchDocumentFor as dispatch,
+  legacyMarkerIdsIn,
+  legacyRouteMarkerText,
   markerIdsIn,
   routeMarkerText,
   sendTaskCompleted,
@@ -30,7 +32,7 @@ test('pointerdown on send button writes the marker into a textarea composer and 
 
   const text = composerTextOf(world);
   assert.equal(markerIdsIn(text).join(), ROUTE_ID);
-  assert.match(text, /please review the worker output\n\n<!-- AI_STUDIO_ROUTE:/);
+  assert.match(text, /please review the worker output\n\n\[AI_STUDIO_ROUTE\]: ai-studio-route:/);
   assert.equal(injectFailures(world).length, 0);
 });
 
@@ -108,6 +110,60 @@ test('an old route marker is replaced by the current route, never stacked', () =
   setComposerText(world, 'hello\n\n' + routeMarkerText(OLD_ROUTE_ID));
 
   dispatch(world, 'keydown', world.composer, { key: 'Enter' });
+
+  const text = composerTextOf(world);
+  assert.deepEqual(markerIdsIn(text), [ROUTE_ID]);
+  assert.equal(text, 'hello\n\n' + routeMarkerText(ROUTE_ID));
+});
+
+test('a legacy HTML comment marker is replaced by the Markdown marker (textarea)', () => {
+  const world = setupPage({ composer: 'textarea' });
+  setComposerText(world, 'hello\n\n' + legacyRouteMarkerText(OLD_ROUTE_ID));
+
+  dispatch(world, 'pointerdown', world.sendButton);
+
+  const text = composerTextOf(world);
+  assert.deepEqual(markerIdsIn(text), [ROUTE_ID]);
+  assert.deepEqual(legacyMarkerIdsIn(text), []);
+  assert.equal(text, 'hello\n\n' + routeMarkerText(ROUTE_ID));
+});
+
+test('a legacy HTML marker with the current route id is still rewritten in Markdown (Lexical)', () => {
+  const world = setupPage({ composer: 'lexical' });
+  setComposerText(world, 'hello\n\n' + legacyRouteMarkerText(ROUTE_ID));
+
+  dispatch(world, 'keydown', world.composer, { key: 'Enter' });
+
+  const text = composerTextOf(world);
+  assert.deepEqual(markerIdsIn(text), [ROUTE_ID]);
+  assert.deepEqual(legacyMarkerIdsIn(text), []);
+  assert.equal(text, 'hello\n\n' + routeMarkerText(ROUTE_ID));
+});
+
+test('mixed legacy and Markdown markers collapse to a single Markdown marker', () => {
+  const world = setupPage({ composer: 'textarea' });
+  setComposerText(
+    world,
+    'hello\n\n' + legacyRouteMarkerText(OLD_ROUTE_ID) + '\n\n' +
+      routeMarkerText(ROUTE_ID) + '\n\n' + routeMarkerText(OLD_ROUTE_ID),
+  );
+
+  dispatch(world, 'pointerdown', world.sendButton);
+
+  const text = composerTextOf(world);
+  assert.deepEqual(markerIdsIn(text), [ROUTE_ID]);
+  assert.deepEqual(legacyMarkerIdsIn(text), []);
+  assert.equal(text, 'hello\n\n' + routeMarkerText(ROUTE_ID));
+});
+
+test('repeated send gestures never stack Markdown markers', () => {
+  const world = setupPage({ composer: 'textarea' });
+  setComposerText(world, 'hello');
+
+  dispatch(world, 'pointerdown', world.sendButton);
+  dispatch(world, 'click', world.sendButton);
+  dispatch(world, 'keydown', world.composer, { key: 'Enter' });
+  dispatch(world, 'pointerdown', world.sendButton);
 
   const text = composerTextOf(world);
   assert.deepEqual(markerIdsIn(text), [ROUTE_ID]);
@@ -244,13 +300,17 @@ test('sendPrompt never clicks send when the composer reverts every write', async
   assert.match(failures[0].detail, /readback-mismatch/);
 });
 
-test('the marker is an invisible HTML comment in the underlying composer payload, not UI text', () => {
+test('the marker is a Markdown reference definition matching the AI Studio backend format', () => {
   const world = setupPage({ composer: 'textarea' });
   setComposerText(world, 'hello');
 
   dispatch(world, 'pointerdown', world.sendButton);
 
   const text = composerTextOf(world);
-  assert.ok(text.startsWith('hello\n\n<!--'));
-  assert.ok(text.endsWith('-->'));
+  assert.equal(
+    text,
+    'hello\n\n[AI_STUDIO_ROUTE]: ai-studio-route:' + ROUTE_ID +
+      ' "pass UUID as route_id; otherwise keep this line in task"',
+  );
+  assert.deepEqual(legacyMarkerIdsIn(text), []);
 });

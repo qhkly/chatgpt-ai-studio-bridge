@@ -326,19 +326,28 @@ export const setComposerText = (world, text) => {
 };
 
 export const routeMarkerText = (routeId) =>
+  '[AI_STUDIO_ROUTE]: ai-studio-route:' + routeId +
+  ' "pass UUID as route_id; otherwise keep this line in task"';
+
+// Pre-Markdown marker format; must still be recognised and replaced.
+export const legacyRouteMarkerText = (routeId) =>
   '<!-- AI_STUDIO_ROUTE:' + routeId +
   '; if using studio_create_session, pass UUID as route_id; ' +
   'if route_id is unavailable, copy this comment unchanged into task -->';
 
-export const MARKER_IDS_RE = /<!--\s*AI_STUDIO_ROUTE:([0-9a-f-]{36})[^>]*-->/gi;
+export const MARKER_IDS_RE = /\[AI_STUDIO_ROUTE\]: ai-studio-route:([0-9a-f-]{36})/gi;
+export const LEGACY_MARKER_IDS_RE = /<!--\s*AI_STUDIO_ROUTE:([0-9a-f-]{36})[^>]*-->/gi;
 
-export const markerIdsIn = (text) => {
+const idsMatching = (re, text) => {
   const ids = [];
-  MARKER_IDS_RE.lastIndex = 0;
+  re.lastIndex = 0;
   let match;
-  while ((match = MARKER_IDS_RE.exec(text)) !== null) ids.push(match[1]);
+  while ((match = re.exec(text)) !== null) ids.push(match[1]);
   return ids;
 };
+
+export const markerIdsIn = (text) => idsMatching(MARKER_IDS_RE, text);
+export const legacyMarkerIdsIn = (text) => idsMatching(LEGACY_MARKER_IDS_RE, text);
 
 // Drives the content script's chrome.runtime.onMessage listener the way the
 // background worker would for a completion notification.

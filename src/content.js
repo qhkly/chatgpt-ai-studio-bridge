@@ -8,7 +8,14 @@ const MARKER_INJECT_ATTEMPTS = 3;
 const ROUTE_PENDING_KEY = 'aiStudio.route.pending';
 const ROUTE_CONVERSATION_PREFIX = 'aiStudio.route.conversation.';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const ROUTE_MARKER_RE = /<!--\s*AI_STUDIO_ROUTE:([0-9a-f-]{36})[^>]*-->/gi;
+// Markdown reference-definition marker: invisible when rendered, but kept in
+// the message text the model sees (HTML comments get stripped upstream).
+// Must match CHATGPT_ROUTE_MARKER_MD_START in AI Studio's tools_chatgpt.rs.
+// Not line-anchored: Lexical's textContent joins paragraphs without newlines.
+const ROUTE_MARKER_RE =
+  /\[AI_STUDIO_ROUTE\]:[ \t]*ai-studio-route:([0-9a-f-]{36})(?:[ \t]+"[^"\n]*")?/gi;
+// Legacy HTML-comment marker: still recognised so it is replaced, never written.
+const LEGACY_ROUTE_MARKER_RE = /<!--\s*AI_STUDIO_ROUTE:([0-9a-f-]{36})[^>]*-->/gi;
 
 let lastObservedUrl = '';
 // Tri-state send-injection health. "Route registered" (badge ON) and "route
@@ -150,29 +157,40 @@ const registerCurrentRoute = () => {
 };
 
 const buildRouteMarker = (routeId) =>
-  '<!-- AI_STUDIO_ROUTE:' + routeId +
-  '; if using studio_create_session, pass UUID as route_id; ' +
-  'if route_id is unavailable, copy this comment unchanged into task -->';
+  '[AI_STUDIO_ROUTE]: ai-studio-route:' + routeId +
+  ' "pass UUID as route_id; otherwise keep this line in task"';
 
-const routeMarkerIds = (text) => {
+const idsMatching = (re, text) => {
   const ids = [];
-  ROUTE_MARKER_RE.lastIndex = 0;
+  re.lastIndex = 0;
   let match;
-  while ((match = ROUTE_MARKER_RE.exec(text)) !== null) {
+  while ((match = re.exec(text)) !== null) {
     ids.push(match[1].toLowerCase());
   }
   return ids;
 };
 
-// The composer text must contain exactly one marker carrying the current
-// route UUID. Extra markers, a stale UUID, or no marker all fail this check.
+// Every route marker in the text, current format and legacy alike.
+const routeMarkerIds = (text) => [
+  ...idsMatching(ROUTE_MARKER_RE, text),
+  ...idsMatching(LEGACY_ROUTE_MARKER_RE, text),
+];
+
+// The composer text must contain exactly one marker — in the current Markdown
+// format — carrying the current route UUID. Extra markers, a stale UUID, a
+// leftover legacy HTML marker, or no marker all fail this check.
 const markerVerified = (composer, routeId) => {
-  const ids = routeMarkerIds(composerRawText(composer));
-  return ids.length === 1 && ids[0] === routeId;
+  const text = composerRawText(composer);
+  const ids = idsMatching(ROUTE_MARKER_RE, text);
+  return ids.length === 1 && ids[0] === routeId &&
+    idsMatching(LEGACY_ROUTE_MARKER_RE, text).length === 0;
 };
 
 const buildTextWithMarker = (text, routeId) => {
-  const withoutOldMarkers = text.replace(ROUTE_MARKER_RE, '').trimEnd();
+  const withoutOldMarkers = text
+    .replace(ROUTE_MARKER_RE, '')
+    .replace(LEGACY_ROUTE_MARKER_RE, '')
+    .trimEnd();
   return withoutOldMarkers +
     (withoutOldMarkers ? '\n\n' : '') +
     buildRouteMarker(routeId);
