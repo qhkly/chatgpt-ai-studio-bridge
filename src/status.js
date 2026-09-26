@@ -64,6 +64,33 @@ export const normalizeInjectionOutcome = (message, tabUrl, now) => {
   };
 };
 
+// Result of the popup's "重新检测当前页面", kept per tab. `status` is the probe
+// status when registration succeeded (ok / failed / skipped / unsupported),
+// or `error` with the failure reason as detail when it did not.
+const REDETECT_STATUSES = ['ok', 'failed', 'skipped', 'unsupported', 'error'];
+
+export const normalizeRedetectResult = (result, routeId, tabUrl, now) => {
+  let status;
+  let detail;
+  if (result?.ok !== true) {
+    status = 'error';
+    detail = result?.reason ?? 'internal-error';
+  } else {
+    status = REDETECT_STATUSES.includes(result.probe?.status)
+      ? result.probe.status
+      : 'unsupported';
+    detail = status === 'ok' ? null : result.probe?.detail ?? null;
+  }
+
+  return {
+    status,
+    detail: detail == null ? null : String(detail).slice(0, DETAIL_MAX),
+    routeId: routeIdOrNull(routeId),
+    at: now,
+    url: sanitizeUrl(tabUrl),
+  };
+};
+
 export const buildStatusSnapshot = ({
   version,
   now,
@@ -73,6 +100,7 @@ export const buildStatusSnapshot = ({
   routeBinding,
   injection,
   lastDelivery,
+  lastRedetect,
   badge,
 }) => {
   const onChatGpt = isChatGptUrl(tab?.url);
@@ -121,11 +149,28 @@ export const buildStatusSnapshot = ({
     },
     route,
     injection: injectionState,
-    lastDelivery: lastDelivery
+    // Route-scoped: a delivery for any other route (an old conversation,
+    // another tab) is not this page's delivery and must not show as one.
+    lastDelivery: lastDelivery && route.routeId &&
+      routeIdOrNull(lastDelivery.routeId) === route.routeId
       ? {
           outcome: String(lastDelivery.outcome),
-          routeId: routeIdOrNull(lastDelivery.routeId),
+          routeId: route.routeId,
           at: timestampOrNull(lastDelivery.at),
+        }
+      : null,
+    // Only a re-detect of the conversation this tab is showing now.
+    lastRedetect: onChatGpt && lastRedetect &&
+      sanitizeUrl(lastRedetect.url) === sanitizeUrl(tab.url)
+      ? {
+          status: REDETECT_STATUSES.includes(lastRedetect.status)
+            ? lastRedetect.status
+            : 'unsupported',
+          detail: lastRedetect.detail == null
+            ? null
+            : String(lastRedetect.detail).slice(0, DETAIL_MAX),
+          routeId: routeIdOrNull(lastRedetect.routeId),
+          at: timestampOrNull(lastRedetect.at),
         }
       : null,
     badge: typeof badge === 'string' ? badge : '',
@@ -162,6 +207,21 @@ const formatClock = (at) => {
 };
 
 const shortId = (routeId) => (routeId ? routeId.slice(0, 8) : '');
+
+const LAST_REDETECT_TEXT = {
+  'composer-has-text': '输入框有内容，未做注入检测',
+  'composer-not-found': '未找到输入框，未做注入检测',
+  unsupported: '页面脚本版本过旧，未做注入检测',
+  error: '检测未完成',
+};
+
+// Why an unverified injection has no probe outcome, if a re-detect ran.
+const describeLastRedetect = (redetect) => {
+  if (!redetect || redetect.status === 'ok' || redetect.status === 'failed') return '';
+  const key = redetect.status === 'skipped' ? redetect.detail : redetect.status;
+  return '最近检测：' + (LAST_REDETECT_TEXT[key] ?? LAST_REDETECT_TEXT.unsupported) +
+    ' · ' + formatClock(redetect.at);
+};
 
 // Four rows, each with a tone the popup maps to a colored dot.
 export const describeSnapshot = (snapshot) => {
@@ -206,7 +266,11 @@ export const describeSnapshot = (snapshot) => {
       detail: explainInjectionDetail(injection.detail) + ' · ' + formatClock(injection.at),
     };
   } else if (injection.state === 'unverified') {
-    injectionRow = { tone: 'muted', text: '尚未验证', detail: '' };
+    injectionRow = {
+      tone: 'muted',
+      text: '尚未验证',
+      detail: describeLastRedetect(snapshot.lastRedetect),
+    };
   } else {
     injectionRow = { tone: 'muted', text: '—', detail: '' };
   }
@@ -234,7 +298,7 @@ export const describeDeliveryIssue = (snapshot) => {
 const iso = (at) => (at ? new Date(at).toISOString() : '-');
 
 export const formatDiagnostics = (snapshot) => {
-  const { localBridge, remoteRelay, tab, route, injection, lastDelivery } = snapshot;
+  const { localBridge, remoteRelay, tab, route, injection, lastDelivery, lastRedetect } = snapshot;
   const lines = [
     'AI Studio → ChatGPT Bridge 诊断',
     'generated: ' + iso(snapshot.generatedAt),
@@ -265,6 +329,13 @@ export const formatDiagnostics = (snapshot) => {
     'last delivery: ' + (lastDelivery
       ? lastDelivery.outcome + ' at=' + iso(lastDelivery.at) +
         ' routeId=' + (lastDelivery.routeId ?? '-')
+      : '-'),
+  );
+  lines.push(
+    'last redetect: ' + (lastRedetect
+      ? lastRedetect.status +
+        (lastRedetect.detail ? ' detail=' + lastRedetect.detail : '') +
+        ' at=' + iso(lastRedetect.at)
       : '-'),
   );
   lines.push('badge: ' + (snapshot.badge || '(empty)'));

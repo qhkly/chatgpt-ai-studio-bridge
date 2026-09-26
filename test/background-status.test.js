@@ -240,24 +240,164 @@ test('popup requests coming from a web page are ignored', withBackground({}, asy
   );
 }));
 
-test('an unmatched completion explains the "!" badge as a delivery problem', withBackground({}, async (world) => {
-  world.localSocket().open();
+const completion = (world, eventId, routeId) => {
   world.localSocket()._fire('message', {
     data: JSON.stringify({
       type: 'task.completed',
-      eventId: 'evt-1',
+      eventId,
       sessionId: 'session-1',
-      routeId: OTHER_ROUTE_ID,
+      routeId,
     }),
   });
-  await flush();
+  return flush();
+};
+
+test('a delivery failure for the current route explains the "!" badge', withBackground({}, async (world) => {
+  world.localSocket().open();
+  await world.fromTab(7, { type: 'aiStudio.routeRegistered', routeId: ROUTE_ID });
+  // Tab 7 has no content script and injection is refused.
+  await completion(world, 'evt-1', ROUTE_ID);
 
   const snapshot = await snapshotOf(world);
   assert.equal(world.badge, '!');
-  assert.equal(snapshot.lastDelivery.outcome, 'unmatched');
-  assert.equal(snapshot.lastDelivery.routeId, OTHER_ROUTE_ID);
+  assert.equal(snapshot.lastDelivery.outcome, 'content-script-unavailable');
+  assert.equal(snapshot.lastDelivery.routeId, ROUTE_ID);
   // Injection itself was never attempted, so it stays unverified.
   assert.equal(snapshot.injection.state, 'unverified');
-  assert.match(describeDeliveryIssue(snapshot), /找不到匹配 route/);
-  assert.match(formatDiagnostics(snapshot), /last delivery: unmatched/);
+  assert.match(describeDeliveryIssue(snapshot), /无法连接 ChatGPT 页面脚本/);
+  assert.match(
+    formatDiagnostics(snapshot),
+    new RegExp('last delivery: content-script-unavailable at=\\S+ routeId=' + ROUTE_ID),
+  );
+}));
+
+test('a delivery for another route is not shown as this page\'s delivery', withBackground({}, async (world) => {
+  world.localSocket().open();
+  await world.fromTab(7, { type: 'aiStudio.routeRegistered', routeId: ROUTE_ID });
+  await completion(world, 'evt-1', OTHER_ROUTE_ID);
+
+  let snapshot = await snapshotOf(world);
+  // The badge still latches, but the popup must not blame this page's route.
+  assert.equal(world.badge, '!');
+  assert.equal(snapshot.route.routeId, ROUTE_ID);
+  assert.equal(snapshot.lastDelivery, null);
+  assert.equal(describeDeliveryIssue(snapshot), '');
+  assert.match(formatDiagnostics(snapshot), /last delivery: -/);
+
+  // An unbound page has no route, so no delivery can be its own.
+  snapshot = await snapshotOf(world, 8);
+  assert.equal(snapshot.route.state, 'unbound');
+  assert.equal(snapshot.lastDelivery, null);
+}));
+
+test('a failed delivery on the old route is dropped once the page re-registers a new route', withBackground({}, async (world) => {
+  world.localSocket().open();
+  await world.fromTab(7, { type: 'aiStudio.routeRegistered', routeId: OTHER_ROUTE_ID });
+  await completion(world, 'evt-1', OTHER_ROUTE_ID);
+  assert.equal((await snapshotOf(world)).lastDelivery.routeId, OTHER_ROUTE_ID);
+
+  await world.fromTab(7, { type: 'aiStudio.routeRegistered', routeId: ROUTE_ID });
+  const snapshot = await snapshotOf(world);
+  assert.equal(snapshot.route.routeId, ROUTE_ID);
+  assert.equal(snapshot.lastDelivery, null);
+  assert.ok(!formatDiagnostics(snapshot).includes('content-script-unavailable'));
+}));
+
+const probeHandler = (world, probe) => async (message) => {
+  if (message.type === 'aiStudio.ping') return { ok: true };
+  await world.fromTab(7, { type: 'aiStudio.routeRegistered', routeId: ROUTE_ID });
+  return { ok: true, routeId: ROUTE_ID, probe };
+};
+
+test('re-detect results are kept per tab and reach snapshot and diagnostics', withBackground({}, async (world) => {
+  let snapshot = await snapshotOf(world);
+  assert.equal(snapshot.lastRedetect, null);
+  assert.match(formatDiagnostics(snapshot), /last redetect: -/);
+
+  // skipped: composer has text -> injection stays unverified, reason recorded.
+  world.tabHandlers.set(7, probeHandler(world, { status: 'skipped', detail: 'composer-has-text' }));
+  await world.popup('aiStudio.popup.redetect', 7);
+  snapshot = await snapshotOf(world);
+  assert.equal(snapshot.injection.state, 'unverified');
+  assert.equal(snapshot.lastRedetect.status, 'skipped');
+  assert.equal(snapshot.lastRedetect.detail, 'composer-has-text');
+  assert.equal(snapshot.lastRedetect.routeId, ROUTE_ID);
+  assert.ok(snapshot.lastRedetect.at);
+  assert.match(rowOf(snapshot, 'injection').detail, /最近检测：输入框有内容，未做注入检测/);
+  assert.match(formatDiagnostics(snapshot), /last redetect: skipped detail=composer-has-text at=\S+/);
+
+  // skipped: composer not found.
+  world.tabHandlers.set(7, probeHandler(world, { status: 'skipped', detail: 'composer-not-found' }));
+  await world.popup('aiStudio.popup.redetect', 7);
+  snapshot = await snapshotOf(world);
+  assert.equal(snapshot.injection.state, 'unverified');
+  assert.equal(snapshot.lastRedetect.detail, 'composer-not-found');
+  assert.match(rowOf(snapshot, 'injection').detail, /未找到输入框/);
+
+  // unsupported: an old content script answers without a probe.
+  world.tabHandlers.set(7, probeHandler(world, null));
+  await world.popup('aiStudio.popup.redetect', 7);
+  snapshot = await snapshotOf(world);
+  assert.equal(snapshot.injection.state, 'unverified');
+  assert.equal(snapshot.lastRedetect.status, 'unsupported');
+  assert.match(formatDiagnostics(snapshot), /last redetect: unsupported at=\S+/);
+
+  // failed: recorded as both the injection outcome and the re-detect result.
+  const failedOutcome = { ok: false, routeId: ROUTE_ID, detail: 'probe-cleanup-failed', source: 'probe' };
+  world.tabHandlers.set(7, probeHandler(world, {
+    status: 'failed', detail: 'probe-cleanup-failed', outcome: failedOutcome,
+  }));
+  await world.popup('aiStudio.popup.redetect', 7);
+  snapshot = await snapshotOf(world);
+  assert.equal(snapshot.injection.state, 'failed');
+  assert.equal(snapshot.lastRedetect.status, 'failed');
+  assert.match(formatDiagnostics(snapshot), /last redetect: failed detail=probe-cleanup-failed/);
+
+  // ok.
+  world.tabHandlers.set(7, probeHandler(world, {
+    status: 'ok',
+    detail: null,
+    outcome: { ok: true, routeId: ROUTE_ID, detail: null, source: 'probe' },
+  }));
+  await world.popup('aiStudio.popup.redetect', 7);
+  snapshot = await snapshotOf(world);
+  assert.equal(snapshot.injection.state, 'ok');
+  assert.deepEqual(
+    { status: snapshot.lastRedetect.status, detail: snapshot.lastRedetect.detail },
+    { status: 'ok', detail: null },
+  );
+  assert.match(formatDiagnostics(snapshot), /last redetect: ok at=\S+/);
+
+  // Other tabs never see tab 7's result.
+  assert.equal((await snapshotOf(world, 8)).lastRedetect, null);
+}));
+
+test('a skipped re-detect does not overwrite an earlier injection outcome', withBackground({}, async (world) => {
+  await injectOutcome(world, 7, { ok: false, detail: 'composer-not-found' });
+  world.tabHandlers.set(7, probeHandler(world, { status: 'skipped', detail: 'composer-has-text' }));
+  await world.popup('aiStudio.popup.redetect', 7);
+
+  const snapshot = await snapshotOf(world);
+  assert.equal(snapshot.injection.state, 'failed');
+  assert.equal(snapshot.injection.detail, 'composer-not-found');
+  assert.equal(snapshot.lastRedetect.status, 'skipped');
+}));
+
+test('a re-detect that could not run is recorded as error; stale results are scoped to the URL', withBackground({}, async (world) => {
+  await world.popup('aiStudio.popup.redetect', 8);
+  let snapshot = await snapshotOf(world, 8);
+  assert.equal(snapshot.lastRedetect.status, 'error');
+  assert.equal(snapshot.lastRedetect.detail, 'content-script-unavailable');
+  assert.match(rowOf(snapshot, 'injection').detail, /最近检测：检测未完成/);
+  assert.match(formatDiagnostics(snapshot), /last redetect: error detail=content-script-unavailable/);
+
+  // The tab navigated to another conversation: the old result no longer applies.
+  world.tabMap.get(8).url = URL_A;
+  assert.equal((await snapshotOf(world, 8)).lastRedetect, null);
+
+  // And it is dropped when the tab closes.
+  world.tabMap.get(8).url = URL_B;
+  await world.removeTab(8);
+  world.tabMap.set(8, { id: 8, url: URL_B });
+  assert.equal((await snapshotOf(world, 8)).lastRedetect, null);
 }));

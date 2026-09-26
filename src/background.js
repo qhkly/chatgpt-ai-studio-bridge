@@ -11,6 +11,7 @@ import {
   buildStatusSnapshot,
   findTabRouteBinding,
   normalizeInjectionOutcome,
+  normalizeRedetectResult,
 } from './status.js';
 
 const REMOTE_SETTINGS_KEY = 'remoteRelay';
@@ -25,6 +26,7 @@ const ROUTE_TTL_MS = 24 * 60 * 60 * 1000;
 // restarts but not a browser restart, and content scripts cannot read it.
 const INJECTION_OUTCOMES_KEY = 'injectionOutcomes';
 const LAST_DELIVERY_KEY = 'lastDelivery';
+const LAST_REDETECTS_KEY = 'lastRedetects';
 
 let localSocket = null;
 let remoteSocket = null;
@@ -71,6 +73,12 @@ const recordInjectionOutcome = (tabId, outcome) =>
   updateSession(INJECTION_OUTCOMES_KEY, (current) => ({
     ...(current ?? {}),
     [tabId]: outcome,
+  }));
+
+const recordRedetect = (tabId, record) =>
+  updateSession(LAST_REDETECTS_KEY, (current) => ({
+    ...(current ?? {}),
+    [tabId]: record,
   }));
 
 const recordDelivery = (outcome, routeId) =>
@@ -486,10 +494,11 @@ const getTabOrNull = async (tabId) => {
 const getStatusSnapshot = async (tabId) => {
   const now = Date.now();
   const tab = await getTabOrNull(tabId);
-  const [bindings, outcomes, lastDelivery, remote, badge] = await Promise.all([
+  const [bindings, outcomes, lastDelivery, redetects, remote, badge] = await Promise.all([
     getRouteBindings(),
     readSession(INJECTION_OUTCOMES_KEY),
     readSession(LAST_DELIVERY_KEY),
+    readSession(LAST_REDETECTS_KEY),
     getRemoteSettings(),
     chrome.action.getBadgeText({}).catch(() => ''),
   ]);
@@ -509,6 +518,7 @@ const getStatusSnapshot = async (tabId) => {
     routeBinding: findTabRouteBinding(bindings, tab, now, ROUTE_TTL_MS),
     injection: tab ? outcomes?.[tab.id] ?? null : null,
     lastDelivery: lastDelivery ?? null,
+    lastRedetect: tab ? redetects?.[tab.id] ?? null : null,
     badge,
   });
 };
@@ -517,12 +527,24 @@ const getStatusSnapshot = async (tabId) => {
 // suppresses onClicked). Re-registers the tab's route and asks the page for a
 // non-destructive injection probe; the probe's own outcome is recorded here
 // too so the popup's next snapshot cannot race the content-script report.
+// Every result on a ChatGPT tab, including a skipped probe, is kept as the
+// tab's lastRedetect so diagnostics can say why injection is unverified.
 const redetectTab = async (tabId) => {
   const tab = await getTabOrNull(tabId);
   if (!tab) return { ok: false, reason: 'tab-not-found' };
   if (!isChatGptUrl(tab.url)) return { ok: false, reason: 'not-chatgpt' };
+
+  const { result, routeId } = await runRedetect(tab);
+  await recordRedetect(
+    tab.id,
+    normalizeRedetectResult(result, routeId, tab.url, Date.now()),
+  );
+  return result;
+};
+
+const runRedetect = async (tab) => {
   if (!(await ensureContentScript(tab.id))) {
-    return { ok: false, reason: 'content-script-unavailable' };
+    return { result: { ok: false, reason: 'content-script-unavailable' } };
   }
 
   let response;
@@ -533,7 +555,7 @@ const redetectTab = async (tabId) => {
     });
   } catch (error) {
     console.error('[AI Studio Bridge] Failed to request route registration', error);
-    return { ok: false, reason: 'registration-request-failed' };
+    return { result: { ok: false, reason: 'registration-request-failed' } };
   }
 
   const probe = response?.probe;
@@ -545,11 +567,14 @@ const redetectTab = async (tabId) => {
   }
 
   return {
-    ok: response?.ok === true,
-    reason: response?.ok === true ? null : 'registration-failed',
-    probe: probe
-      ? { status: String(probe.status), detail: probe.detail ?? null }
-      : { status: 'unsupported', detail: null },
+    routeId: response?.routeId ?? null,
+    result: {
+      ok: response?.ok === true,
+      reason: response?.ok === true ? null : 'registration-failed',
+      probe: probe
+        ? { status: String(probe.status), detail: probe.detail ?? null }
+        : { status: 'unsupported', detail: null },
+    },
   };
 };
 
@@ -641,11 +666,13 @@ const registerOpenChatGptTabs = async () => {
 };
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  updateSession(INJECTION_OUTCOMES_KEY, (current) => {
-    const next = { ...(current ?? {}) };
-    delete next[tabId];
-    return next;
-  });
+  for (const key of [INJECTION_OUTCOMES_KEY, LAST_REDETECTS_KEY]) {
+    updateSession(key, (current) => {
+      const next = { ...(current ?? {}) };
+      delete next[tabId];
+      return next;
+    });
+  }
 
   const stored = await chrome.storage.local.get(ROUTE_BINDINGS_KEY);
   const routes = stored[ROUTE_BINDINGS_KEY] ?? {};

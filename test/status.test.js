@@ -6,7 +6,9 @@ import {
   describeRedetect,
   describeSnapshot,
   findTabRouteBinding,
+  formatDiagnostics,
   normalizeInjectionOutcome,
+  normalizeRedetectResult,
   sanitizeUrl,
 } from '../src/status.js';
 
@@ -93,4 +95,55 @@ test('describeRedetect never turns a skipped probe into success', () => {
   assert.match(failed.text, /清理/);
   assert.equal(describeRedetect({ ok: false, reason: 'not-chatgpt' }).tone, 'bad');
   assert.equal(describeRedetect(undefined).tone, 'bad');
+});
+
+const OTHER_ROUTE_ID = '99999999-8888-7777-6666-555555555555';
+
+const baseInput = (overrides) => ({
+  version: '1.2.3',
+  now: 1,
+  localBridge: null,
+  remoteRelay: null,
+  tab: { id: 7, url: URL_A },
+  routeBinding: { routeId: ROUTE_ID, at: 10 },
+  injection: null,
+  lastDelivery: null,
+  lastRedetect: null,
+  badge: '',
+  ...overrides,
+});
+
+test('snapshot keeps only the delivery for the current route', () => {
+  const kept = buildStatusSnapshot(baseInput({
+    lastDelivery: { outcome: 'failed', routeId: ROUTE_ID.toUpperCase(), at: 20 },
+  }));
+  assert.deepEqual(kept.lastDelivery, { outcome: 'failed', routeId: ROUTE_ID, at: 20 });
+
+  const stale = buildStatusSnapshot(baseInput({
+    lastDelivery: { outcome: 'failed', routeId: OTHER_ROUTE_ID, at: 20 },
+  }));
+  assert.equal(stale.lastDelivery, null);
+  assert.match(formatDiagnostics(stale), /last delivery: -/);
+
+  const unbound = buildStatusSnapshot(baseInput({
+    routeBinding: null,
+    lastDelivery: { outcome: 'failed', routeId: null, at: 20 },
+  }));
+  assert.equal(unbound.lastDelivery, null);
+});
+
+test('normalizeRedetectResult distinguishes probe outcomes and failures', () => {
+  const norm = (result) => normalizeRedetectResult(result, ROUTE_ID, URL_A + '?x=1', 5);
+  assert.deepEqual(norm({ ok: true, probe: { status: 'ok', detail: 'x' } }),
+    { status: 'ok', detail: null, routeId: ROUTE_ID, at: 5, url: URL_A });
+  assert.equal(norm({ ok: true, probe: { status: 'failed', detail: 'probe-cleanup-failed' } }).detail,
+    'probe-cleanup-failed');
+  assert.deepEqual(
+    norm({ ok: true, probe: { status: 'skipped', detail: 'composer-has-text' } }).status, 'skipped');
+  assert.equal(norm({ ok: true, probe: { status: 'weird' } }).status, 'unsupported');
+  assert.deepEqual(
+    [norm({ ok: false, reason: 'registration-failed' }).status,
+      norm({ ok: false, reason: 'registration-failed' }).detail],
+    ['error', 'registration-failed'],
+  );
 });
