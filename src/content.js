@@ -23,17 +23,216 @@ let lastObservedUrl = '';
 // registration never masks a failed send injection.
 let lastInjectionOk = null;
 
-const findComposer = () =>
-  document.querySelector('#prompt-textarea') ||
-  document.querySelector('[contenteditable="true"][data-lexical-editor="true"]');
+// --- Composer resolver --------------------------------------------------------
+// ChatGPT ships several composer generations (React textarea, Lexical, and the
+// current ProseMirror editor with data-composer-* wrappers). Candidates are
+// collected inside the composer containers first, every candidate is
+// validated (connected, visible, editable, non-zero size), and the best-scored
+// one wins. The page is never blindly searched for "the first contenteditable".
+const COMPOSER_SCOPE_SELECTORS = [
+  'form[data-chatgpt-composer]',
+  '[data-composer-body]',
+  '[data-composer-input-layout]',
+  '[data-rich-text-layout]',
+];
 
-const SEND_BUTTON_SELECTOR = [
+// Precise selectors are also tried page-wide; generic ones only inside a
+// composer container, where they cannot hit an unrelated editor.
+const COMPOSER_CANDIDATES = [
+  { selector: '[data-testid="prompt-textarea"]', precise: true },
+  { selector: '#prompt-textarea', precise: true },
+  { selector: '[data-composer-markdown][contenteditable="true"][role="textbox"]', precise: true },
+  { selector: 'div.ProseMirror[contenteditable="true"][role="textbox"]', precise: true },
+  { selector: '[contenteditable="true"][data-lexical-editor="true"]', precise: true },
+  // Editability left to validation, so a read-only editor (e.g. while a reply
+  // streams) is diagnosed as readonly instead of "selectors missed".
+  { selector: '[data-composer-markdown]', precise: true },
+  { selector: 'div.ProseMirror', precise: true },
+  { selector: '[contenteditable="true"][role="textbox"]', precise: false },
+  { selector: 'textarea', precise: false },
+];
+
+const COMPOSER_ARIA_LABELS = ['询问 ChatGPT', 'Ask ChatGPT', 'Message ChatGPT', 'Ask anything'];
+
+const queryAll = (root, selector) => {
+  try {
+    return Array.from(root.querySelectorAll(selector));
+  } catch {
+    return [];
+  }
+};
+
+const isHiddenElement = (element) => {
+  for (let el = element; el && el.getAttribute; el = el.parentElement ?? el.parent) {
+    if (el.getAttribute('hidden') !== null || el.getAttribute('aria-hidden') === 'true') {
+      return true;
+    }
+    if (el.getAttribute('inert') !== null) return true;
+  }
+  if (typeof window.getComputedStyle === 'function') {
+    try {
+      const style = window.getComputedStyle(element);
+      if (style?.display === 'none' || style?.visibility === 'hidden') return true;
+    } catch {
+    }
+  }
+  return false;
+};
+
+const hasLayoutBox = (element) => {
+  if (typeof element.getBoundingClientRect !== 'function') return true;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+};
+
+const isEditableComposer = (element) => {
+  if (element.getAttribute('aria-disabled') === 'true' ||
+      element.getAttribute('aria-readonly') === 'true') {
+    return false;
+  }
+  if (element instanceof HTMLTextAreaElement) {
+    return !element.disabled && !element.readOnly &&
+      element.getAttribute('disabled') === null &&
+      element.getAttribute('readonly') === null;
+  }
+  if (typeof element.isContentEditable === 'boolean') return element.isContentEditable;
+  const editable = element.getAttribute('contenteditable');
+  return editable === 'true' || editable === '' || editable === 'plaintext-only';
+};
+
+// null when usable, otherwise the rejection reason (diagnostics only).
+const composerRejection = (element) => {
+  if (!element?.isConnected) return 'disconnected';
+  if (isHiddenElement(element) || !hasLayoutBox(element)) return 'hidden';
+  if (!isEditableComposer(element)) return 'readonly';
+  return null;
+};
+
+const scoreComposer = (element, inScope, selectorIndex) => {
+  let score = COMPOSER_CANDIDATES.length - selectorIndex;
+  if (inScope) score += 20;
+  if (element.getAttribute('data-composer-markdown') !== null) score += 8;
+  if (/(?:^|\s)ProseMirror(?:\s|$)/.test(element.getAttribute('class') ?? '')) score += 6;
+  if (element.getAttribute('role') === 'textbox') score += 3;
+  if (COMPOSER_ARIA_LABELS.includes(element.getAttribute('aria-label'))) score += 4;
+  if (element.getAttribute('id') === 'prompt-textarea' ||
+      element.getAttribute('data-testid') === 'prompt-textarea') {
+    score += 4;
+  }
+  return score;
+};
+
+const composerScopes = () => {
+  const scopes = [];
+  for (const selector of COMPOSER_SCOPE_SELECTORS) {
+    for (const scope of queryAll(document, selector)) {
+      if (!scopes.includes(scope)) scopes.push(scope);
+    }
+  }
+  return scopes;
+};
+
+// Returns { composer, summary }. summary is a short, content-free capability
+// string (counts and a reason) explaining a miss; it never contains text.
+const resolveComposer = () => {
+  const scopes = composerScopes();
+  const seen = new Map();
+
+  const consider = (element, inScope, selectorIndex) => {
+    const score = scoreComposer(element, inScope, selectorIndex);
+    const previous = seen.get(element);
+    if (previous === undefined || score > previous) seen.set(element, score);
+  };
+
+  COMPOSER_CANDIDATES.forEach(({ selector, precise }, index) => {
+    for (const scope of scopes) {
+      for (const element of queryAll(scope, selector)) consider(element, true, index);
+    }
+    if (precise) {
+      for (const element of queryAll(document, selector)) {
+        consider(element, scopes.some((scope) => scope.contains(element)), index);
+      }
+    }
+  });
+
+  let best = null;
+  let bestScore = -Infinity;
+  const rejections = { disconnected: 0, hidden: 0, readonly: 0 };
+  for (const [element, score] of seen) {
+    const rejection = composerRejection(element);
+    if (rejection) {
+      rejections[rejection]++;
+      continue;
+    }
+    if (score > bestScore) {
+      best = element;
+      bestScore = score;
+    }
+  }
+
+  if (best) return { composer: best, summary: null };
+
+  const candidates = seen.size;
+  let reason = 'rejected';
+  if (candidates === 0) reason = 'selectors-missed';
+  else if (rejections.hidden === candidates) reason = 'hidden-only';
+  else if (rejections.readonly === candidates) reason = 'readonly-only';
+  return {
+    composer: null,
+    summary: reason + ';scopes=' + scopes.length + ';candidates=' + candidates +
+      ';hidden=' + rejections.hidden + ';readonly=' + rejections.readonly,
+  };
+};
+
+const findComposer = () => resolveComposer().composer;
+
+const composerNotFoundDetail = (summary = resolveComposer().summary) =>
+  summary ? 'composer-not-found:' + summary : 'composer-not-found';
+
+// --- Send button -------------------------------------------------------------
+const PRECISE_SEND_SELECTORS = [
   '[data-testid="send-button"]',
   'button[aria-label="Send prompt"]',
   'button[aria-label="发送提示"]',
-].join(',');
+];
+// A bare submit button only counts when it sits next to the composer.
+const NEARBY_SEND_SELECTORS = [...PRECISE_SEND_SELECTORS, 'button[type="submit"]'];
+const SEND_BUTTON_SELECTOR = NEARBY_SEND_SELECTORS.join(',');
+const SEND_SEARCH_DEPTH = 8;
 
-const findSendButton = () => document.querySelector(SEND_BUTTON_SELECTOR);
+// While a reply streams the same slot holds a stop button ("停止"/"Stop").
+const isStopButton = (button) =>
+  button.getAttribute('data-testid') === 'stop-button' ||
+  /^(?:stop|停止)/i.test(button.getAttribute('aria-label') ?? '');
+
+const isUsableSendButton = (button) =>
+  !!button?.isConnected && !isStopButton(button) && !isHiddenElement(button);
+
+const composerAncestors = (composer) => {
+  const ancestors = [];
+  let el = composer?.parentElement ?? composer?.parent ?? null;
+  for (let depth = 0; el && depth < SEND_SEARCH_DEPTH; depth++) {
+    if (el === document.body || el === document.documentElement) break;
+    ancestors.push(el);
+    if (el.tagName === 'FORM') break;
+    el = el.parentElement ?? el.parent ?? null;
+  }
+  return ancestors;
+};
+
+const findSendButton = (composer = findComposer()) => {
+  for (const ancestor of composerAncestors(composer)) {
+    for (const selector of NEARBY_SEND_SELECTORS) {
+      const button = queryAll(ancestor, selector).find(isUsableSendButton);
+      if (button) return button;
+    }
+  }
+  for (const selector of PRECISE_SEND_SELECTORS) {
+    const button = queryAll(document, selector).find(isUsableSendButton);
+    if (button) return button;
+  }
+  return null;
+};
 
 const composerRawText = (element) => {
   if (element instanceof HTMLTextAreaElement) return element.value;
@@ -246,10 +445,11 @@ const injectRouteMarker = (
   { reportMissingComposer = true, source = 'send' } = {},
 ) => {
   if (!composer) {
+    const detail = composerNotFoundDetail();
     if (reportMissingComposer) {
-      reportInjectionOutcome(false, null, 'composer-not-found', source);
+      reportInjectionOutcome(false, null, detail, source);
     }
-    return { ok: false, routeId: null, detail: 'composer-not-found' };
+    return { ok: false, routeId: null, detail };
   }
 
   const routeId = registerCurrentRoute();
@@ -297,8 +497,8 @@ const nonMarkerText = (composer) =>
     .trim();
 
 const probeInjection = async () => {
-  const composer = findComposer();
-  if (!composer) return { status: 'skipped', detail: 'composer-not-found' };
+  const { composer, summary } = resolveComposer();
+  if (!composer) return { status: 'skipped', detail: composerNotFoundDetail(summary) };
   if (composerRawText(composer).trim() !== '') {
     return { status: 'skipped', detail: 'composer-has-text' };
   }
@@ -397,7 +597,7 @@ const sendPrompt = async (prompt) => {
         return false;
       }
 
-      const sendButton = findSendButton();
+      const sendButton = findSendButton(composer);
       if (sendButton && !sendButton.disabled) {
         sendButton.click();
         return true;
@@ -410,10 +610,18 @@ const sendPrompt = async (prompt) => {
   return false;
 };
 
-const sendGestureTarget = (event) =>
-  event.target instanceof Element
-    ? event.target.closest(SEND_BUTTON_SELECTOR)
+// A precise send button anywhere, or a bare submit button that shares the
+// composer's container; never a stop button.
+const sendGestureTarget = (event) => {
+  if (!(event.target instanceof Element)) return null;
+  const button = event.target.closest(SEND_BUTTON_SELECTOR);
+  if (!button || isStopButton(button)) return null;
+  if (PRECISE_SEND_SELECTORS.some((selector) => button.matches(selector))) return button;
+  const composer = findComposer();
+  return composer && composerAncestors(composer).some((el) => el.contains(button))
+    ? button
     : null;
+};
 
 // pointerdown fires before the app's click handler reads the editor state:
 // inject and verify while there is still time for a retry to land.

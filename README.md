@@ -41,6 +41,10 @@
 - **重新检测当前页面**：替代原来的“点击图标重新注册”。重新注册当前 tab 的 route；若输入框为空，会做一次注入能力检测（写入 marker → 读回校验 → 同一任务内清空），不会留下 marker。输入框里有内容时不做检测，注入状态保持原样（可能为“尚未验证”），不会伪造成功。最近一次检测结果（ok / failed / skipped + 原因 / unsupported / error）按 tab 记在后台 session 状态里，只对当前会话 URL 有效。
 - **复制诊断信息**：复制纯文本诊断（版本、本地桥/远程中继连接状态、当前 tab URL（去掉 query）、route、最近注入/投递结果、最近一次重新检测结果）。投递结果只显示当前页面 route 的记录，其他/旧 route 的投递不会显示。不包含 relay token 或 relay 地址。
 
+## 输入框识别（composer resolver）
+
+兼容 ChatGPT 各代输入框：旧版 `#prompt-textarea`、Lexical，以及当前的 ProseMirror（`div.ProseMirror[contenteditable][role=textbox][data-composer-markdown]`，外层 `data-composer-*`）。先在 composer 容器（`form[data-chatgpt-composer]` / `[data-composer-body]` / `[data-composer-input-layout]` / `[data-rich-text-layout]`）内找候选，精确选择器才会全页面兜底；泛化选择器（`[contenteditable][role=textbox]`、`textarea`）只在容器内使用，不会全页面盲选。每个候选须 connected、非 hidden/aria-hidden、可编辑、宽高 > 0，多个候选按“在容器内 / data-composer-markdown / ProseMirror / role=textbox / aria-label”打分。发送按钮优先在输入框附近（同一 form）查找，停止按钮（“停止”/Stop）不算发送。找不到时 `composer-not-found:` 后附一段不含正文的摘要（如 `hidden-only;scopes=3;candidates=1;hidden=1;readonly=0`）。
+
 ## 发布（Release）
 
 普通 push 到 main 只跑 `npm test`（CI），**不会**生成 ZIP、不会更新 version.json、不会创建 Release。

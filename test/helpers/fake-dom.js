@@ -6,25 +6,31 @@ import { randomUUID } from 'node:crypto';
 
 const CONVERSATION_ID = 'b72b6f8f-20ce-4c89-a54f-7cb52c9d0f42';
 
-const matchesAttrSelector = (element, selector) => {
-  let rest = selector;
-
-  const tagMatch = rest.match(/^[a-zA-Z][a-zA-Z0-9-]*/);
-  if (tagMatch) {
-    if (element.tagName !== tagMatch[0].toUpperCase()) return false;
-    rest = rest.slice(tagMatch[0].length);
-  }
-
-  const attrs = [...rest.matchAll(/\[([a-zA-Z-]+)="([^"]*)"\]/g)];
-  if (attrs.length === 0) return false;
-
-  return attrs.every(([, name, value]) => element.getAttribute(name) === value);
-};
+// Compound selectors only (no combinators): tag, #id, .class, [attr],
+// [attr="value"], comma-separated lists.
+const COMPOUND_TOKEN_RE = /^(?:([a-zA-Z][a-zA-Z0-9-]*)|#([\w-]+)|\.([\w-]+)|\[([a-zA-Z-]+)(?:="([^"]*)")?\])/;
 
 const matchesSimpleSelector = (element, simple) => {
-  simple = simple.trim();
-  if (simple.startsWith('#')) return element.getAttribute('id') === simple.slice(1);
-  return matchesAttrSelector(element, simple);
+  let rest = simple.trim();
+  if (!rest) return false;
+  while (rest) {
+    const match = rest.match(COMPOUND_TOKEN_RE);
+    if (!match) throw new Error('fake-dom: unsupported selector ' + simple);
+    const [token, tag, id, className, attr, value] = match;
+    if (tag && element.tagName !== tag.toUpperCase()) return false;
+    if (id && element.getAttribute('id') !== id) return false;
+    if (className &&
+        !(element.getAttribute('class') ?? '').split(/\s+/).includes(className)) {
+      return false;
+    }
+    if (attr) {
+      const actual = element.getAttribute(attr);
+      if (actual === null) return false;
+      if (value !== undefined && actual !== value) return false;
+    }
+    rest = rest.slice(token.length);
+  }
+  return true;
 };
 
 const matchesSelector = (element, selector) =>
@@ -33,6 +39,18 @@ const matchesSelector = (element, selector) =>
     .map((part) => part.trim())
     .filter(Boolean)
     .some((simple) => matchesSimpleSelector(element, simple));
+
+const descendantsOf = (root) => {
+  const out = [];
+  const walk = (node) => {
+    for (const child of node.childNodes) {
+      out.push(child);
+      walk(child);
+    }
+  };
+  walk(root);
+  return out;
+};
 
 class FakeNode {
   constructor() {
@@ -58,10 +76,48 @@ class FakeElement extends FakeNode {
     this.focused = false;
     this.clicks = 0;
     this._listeners = {};
+    // Layout box reported by getBoundingClientRect; tests shrink it to 0x0.
+    this.rect = { width: 320, height: 24 };
   }
 
   getAttribute(name) {
     return this.attributes[name] ?? null;
+  }
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+
+  get parentElement() {
+    return this.parent instanceof FakeElement ? this.parent : null;
+  }
+
+  // Attached means reachable from <body> through live childNodes links.
+  get isConnected() {
+    const body = this.ownerDocument?.body;
+    let node = this;
+    while (node !== body) {
+      const parent = node.parent;
+      if (!parent || !parent.childNodes.includes(node)) return false;
+      node = parent;
+    }
+    return true;
+  }
+
+  getBoundingClientRect() {
+    return { ...this.rect };
+  }
+
+  matches(selector) {
+    return matchesSelector(this, selector);
+  }
+
+  querySelectorAll(selector) {
+    return descendantsOf(this).filter((element) => matchesSelector(element, selector));
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
   }
 
   get textContent() {
@@ -74,6 +130,8 @@ class FakeElement extends FakeNode {
 
   appendChild(child) {
     child.parent = this;
+    child.ownerDocument ??= this.ownerDocument;
+    for (const node of descendantsOf(child)) node.ownerDocument ??= this.ownerDocument;
     this.childNodes.push(child);
     return child;
   }
@@ -143,18 +201,11 @@ const createWorld = ({ execCommand } = {}) => {
     document._listeners.push({ type, listener });
   };
 
-  const allElements = () => {
-    const out = [];
-    const walk = (element) => {
-      out.push(element);
-      element.childNodes.forEach(walk);
-    };
-    walk(document.body);
-    return out;
-  };
+  const allElements = () => [document.body, ...descendantsOf(document.body)];
 
-  document.querySelector = (selector) =>
-    allElements().find((element) => matchesSelector(element, selector)) ?? null;
+  document.querySelectorAll = (selector) =>
+    allElements().filter((element) => matchesSelector(element, selector));
+  document.querySelector = (selector) => document.querySelectorAll(selector)[0] ?? null;
 
   document.createRange = () => ({ selectNodeContents() {} });
   document.execCommand = (command, showUI, value) => {
@@ -287,32 +338,76 @@ const dispatchDocument = (world, type, target, init = {}) => {
   return event;
 };
 
-// Builds a ChatGPT-like page: a composer (textarea or Lexical-style
-// contenteditable) plus a send button nested inside a toolbar wrapper, then
-// executes the real content script against it.
-export const setupPage = ({ composer = 'textarea', execCommand, routeId } = {}) => {
+const el = (tag, attributes = {}, children = []) => {
+  const element = tag === 'textarea'
+    ? new FakeHTMLTextAreaElement(attributes)
+    : new FakeElement(tag, attributes);
+  for (const child of children) element.appendChild(child);
+  return element;
+};
+export { el as fakeElement };
+
+// Mirrors the current ChatGPT DOM: a ProseMirror editor with
+// data-composer-markdown/role=textbox inside data-composer-* wrappers, and the
+// send button in the same composer form (outside the rich-text layout).
+const buildProseMirrorComposer = () => {
+  const composer = el('div', {
+    contenteditable: 'true',
+    'aria-multiline': 'true',
+    role: 'textbox',
+    class: 'ProseMirror',
+    'data-composer-markdown': '',
+    'aria-label': '询问 ChatGPT',
+    translate: 'no',
+  });
+  const sendButton = el('button', {
+    'data-testid': 'send-button',
+    'aria-label': '发送提示',
+    class: 'composer-submit-btn',
+  });
+  const form = el('form', { class: 'group/composer', 'data-type': 'unified-composer' }, [
+    el('div', { 'data-composer-layout-root': '', class: 'ComposerLayoutRoot' }, [
+      el('div', { 'data-composer-body': '' }, [
+        el('div', { 'data-composer-input-layout': '' }, [
+          el('div', { 'data-rich-text-layout': '' }, [composer]),
+        ]),
+      ]),
+      el('div', { 'data-composer-trailing': '' }, [sendButton]),
+    ]),
+  ]);
+  return { root: form, composer, sendButton };
+};
+
+// Builds a ChatGPT-like page — a composer (textarea, Lexical-style or
+// ProseMirror contenteditable) plus a send button — then executes the real
+// content script against it. `decorate(world)` may add extra DOM first.
+export const setupPage = ({ composer = 'textarea', execCommand, routeId, decorate } = {}) => {
   const world = createWorld({ execCommand });
 
-  const composerElement = composer === 'textarea'
-    ? new FakeHTMLTextAreaElement({ id: 'prompt-textarea' })
-    : new FakeElement('div', { contenteditable: 'true', 'data-lexical-editor': 'true' });
-  composerElement.ownerDocument = world.document;
+  let root;
+  let composerElement;
+  let sendButton;
+  if (composer === 'prosemirror') {
+    ({ root, composer: composerElement, sendButton } = buildProseMirrorComposer());
+  } else {
+    composerElement = composer === 'textarea'
+      ? new FakeHTMLTextAreaElement({ id: 'prompt-textarea' })
+      : new FakeElement('div', { contenteditable: 'true', 'data-lexical-editor': 'true' });
+    sendButton = new FakeElement('button', { 'data-testid': 'send-button' });
+    root = el('div', {}, [composerElement, el('div', {}, [sendButton])]);
+  }
 
-  const toolbar = new FakeElement('div');
-  toolbar.ownerDocument = world.document;
-  const sendButton = new FakeElement('button', { 'data-testid': 'send-button' });
-  sendButton.ownerDocument = world.document;
-  toolbar.appendChild(sendButton);
-
-  world.document.body.appendChild(composerElement);
-  world.document.body.appendChild(toolbar);
+  root.ownerDocument = world.document;
+  world.document.body.appendChild(root);
   world.composer = composerElement;
   world.sendButton = sendButton;
+  world.composerRoot = root;
   world.isTextarea = composer === 'textarea';
 
   if (routeId) world.setFixedRoute(routeId);
   else world.setFixedRoute('11111111-2222-3333-4444-555555555555');
 
+  decorate?.(world);
   loadContentScript();
   world.sentMessages.length = 0; // drop the initial registration burst
   return world;

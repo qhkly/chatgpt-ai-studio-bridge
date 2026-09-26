@@ -5,6 +5,7 @@ import {
   buildStatusSnapshot,
   describeRedetect,
   describeSnapshot,
+  explainInjectionDetail,
   findTabRouteBinding,
   formatDiagnostics,
   normalizeInjectionOutcome,
@@ -146,4 +147,31 @@ test('normalizeRedetectResult distinguishes probe outcomes and failures', () => 
       norm({ ok: false, reason: 'registration-failed' }).detail],
     ['error', 'registration-failed'],
   );
+});
+
+test('composer-not-found details with a resolver summary keep their meaning', () => {
+  const detail = 'composer-not-found:hidden-only;scopes=3;candidates=1;hidden=1;readonly=0';
+  assert.equal(explainInjectionDetail(detail), '找不到 ChatGPT 输入框（输入框不可见）');
+  assert.equal(explainInjectionDetail('composer-not-found'), '找不到 ChatGPT 输入框');
+
+  const redetect = describeRedetect({ ok: true, probe: { status: 'skipped', detail } });
+  assert.equal(redetect.tone, 'muted');
+  assert.equal(redetect.text, 'route 已重新注册；未找到输入框，未做注入检测（输入框不可见）');
+
+  const missed = describeRedetect({
+    ok: true,
+    probe: { status: 'skipped', detail: 'composer-not-found:selectors-missed;scopes=0;candidates=0;hidden=0;readonly=0' },
+  });
+  assert.match(missed.text, /页面结构未识别/);
+});
+
+test('an unverified injection row explains a composer miss from the last re-detect', () => {
+  const detail = 'composer-not-found:readonly-only;scopes=3;candidates=1;hidden=0;readonly=1';
+  const snapshot = buildStatusSnapshot(baseInput({
+    lastRedetect: { status: 'skipped', detail, routeId: ROUTE_ID, at: 20, url: URL_A },
+  }));
+  const row = describeSnapshot(snapshot).find((candidate) => candidate.key === 'injection');
+  assert.equal(row.text, '尚未验证');
+  assert.match(row.detail, /^最近检测：未找到输入框，未做注入检测（输入框不可编辑） · /);
+  assert.match(formatDiagnostics(snapshot), /last redetect: skipped detail=composer-not-found:readonly-only;/);
 });

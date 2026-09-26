@@ -201,7 +201,11 @@ test('re-detect without a composer only registers the route', () =>
     const response = await redetect(world);
 
     assert.equal(response.ok, true);
-    assert.deepEqual(response.probe, { status: 'skipped', detail: 'composer-not-found' });
+    assert.equal(response.probe.status, 'skipped');
+    assert.equal(
+      response.probe.detail,
+      'composer-not-found:selectors-missed;scopes=0;candidates=0;hidden=0;readonly=0',
+    );
     assert.equal(outcomes(world).length, 0);
   }));
 

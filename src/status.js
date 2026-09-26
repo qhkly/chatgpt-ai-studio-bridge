@@ -179,8 +179,25 @@ export const buildStatusSnapshot = ({
 
 // --- Presentation -----------------------------------------------------------
 
+// composer-not-found may carry a content-free resolver summary after a colon,
+// e.g. "composer-not-found:hidden-only;scopes=1;candidates=2;hidden=2;readonly=0".
+const detailKey = (detail) => String(detail ?? '').split(':')[0];
+
+const COMPOSER_MISS_TEXT = {
+  'selectors-missed': '页面结构未识别',
+  'hidden-only': '输入框不可见',
+  'readonly-only': '输入框不可编辑',
+  rejected: '候选输入框均不可用',
+};
+
+const composerMissSuffix = (detail) => {
+  const reason = String(detail ?? '').split(':')[1]?.split(';')[0];
+  const text = reason ? COMPOSER_MISS_TEXT[reason] : null;
+  return text ? '（' + text + '）' : '';
+};
+
 const INJECTION_REASONS = [
-  [/^composer-not-found$/, '找不到 ChatGPT 输入框'],
+  [/^composer-not-found(?::|$)/, '找不到 ChatGPT 输入框'],
   [/^settled-readback-mismatch$/, 'marker 写入后被页面还原'],
   [/^pre-send-readback-mismatch$/, '发送前最终校验未通过'],
   [/^probe-cleanup-failed$/, '检测后无法清理输入框'],
@@ -190,7 +207,8 @@ const INJECTION_REASONS = [
 export const explainInjectionDetail = (detail) => {
   if (!detail) return '';
   const hit = INJECTION_REASONS.find(([pattern]) => pattern.test(detail));
-  return hit ? hit[1] : '未知原因';
+  if (!hit) return '未知原因';
+  return detailKey(detail) === 'composer-not-found' ? hit[1] + composerMissSuffix(detail) : hit[1];
 };
 
 const DELIVERY_TEXT = {
@@ -218,8 +236,9 @@ const LAST_REDETECT_TEXT = {
 // Why an unverified injection has no probe outcome, if a re-detect ran.
 const describeLastRedetect = (redetect) => {
   if (!redetect || redetect.status === 'ok' || redetect.status === 'failed') return '';
-  const key = redetect.status === 'skipped' ? redetect.detail : redetect.status;
-  return '最近检测：' + (LAST_REDETECT_TEXT[key] ?? LAST_REDETECT_TEXT.unsupported) +
+  const key = redetect.status === 'skipped' ? detailKey(redetect.detail) : redetect.status;
+  const suffix = key === 'composer-not-found' ? composerMissSuffix(redetect.detail) : '';
+  return '最近检测：' + (LAST_REDETECT_TEXT[key] ?? LAST_REDETECT_TEXT.unsupported) + suffix +
     ' · ' + formatClock(redetect.at);
 };
 
@@ -377,9 +396,10 @@ export const describeRedetect = (result) => {
       text: 'route 已重新注册；注入检测失败：' + explainInjectionDetail(probe.detail),
     };
   }
-  const key = probe.status === 'skipped' ? probe.detail : 'unsupported';
+  const key = probe.status === 'skipped' ? detailKey(probe.detail) : 'unsupported';
+  const suffix = key === 'composer-not-found' ? composerMissSuffix(probe.detail) : '';
   return {
     tone: 'muted',
-    text: 'route 已重新注册；' + (PROBE_TEXT[key] ?? PROBE_TEXT.unsupported),
+    text: 'route 已重新注册；' + (PROBE_TEXT[key] ?? PROBE_TEXT.unsupported) + suffix,
   };
 };
