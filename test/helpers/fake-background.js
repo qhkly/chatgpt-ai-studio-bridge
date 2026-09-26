@@ -37,11 +37,18 @@ class FakeWebSocket {
   close() {
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
-    this._fire('close');
+    this._fire('close', { code: 1005 });
+  }
+
+  // The peer closed the connection with a specific close code.
+  serverClose(code) {
+    if (this.readyState === FakeWebSocket.CLOSED) return;
+    this.readyState = FakeWebSocket.CLOSED;
+    this._fire('close', { code });
   }
 }
 
-const createStorageArea = (initial = {}) => {
+const createStorageArea = (initial = {}, onSet = () => {}) => {
   const data = structuredClone(initial);
   return {
     data,
@@ -52,7 +59,12 @@ const createStorageArea = (initial = {}) => {
       return structuredClone(data);
     },
     set: async (items) => {
+      const changes = Object.fromEntries(Object.keys(items).map((key) => [
+        key,
+        { oldValue: structuredClone(data[key]), newValue: structuredClone(items[key]) },
+      ]));
       Object.assign(data, structuredClone(items));
+      onSet(changes);
     },
   };
 };
@@ -63,12 +75,19 @@ export const setupBackground = async ({
   version = '9.9.9',
   local = {},
   tabs = [],
+  fetch = async () => {
+    throw new TypeError('Failed to fetch');
+  },
+  // Deliver chrome.storage.onChanged like Chrome does. Off by default so
+  // older tests keep their exact socket counts.
+  emitStorageChanges = false,
 } = {}) => {
   FakeWebSocket.instances = [];
 
   const listeners = {
     message: [],
     removed: [],
+    storageChanged: [],
   };
   const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
   const world = {
@@ -81,9 +100,12 @@ export const setupBackground = async ({
 
   const chrome = {
     storage: {
-      local: createStorageArea(local),
+      local: createStorageArea(local, (changes) => {
+        if (!emitStorageChanges) return;
+        for (const listener of listeners.storageChanged) listener(changes, 'local');
+      }),
       session: createStorageArea(),
-      onChanged: { addListener() {} },
+      onChanged: { addListener: (listener) => listeners.storageChanged.push(listener) },
     },
     tabs: {
       get: async (tabId) => {
@@ -123,11 +145,25 @@ export const setupBackground = async ({
   };
 
   const noop = () => 0;
+  // Timers never fire on their own; tests may run the pending ones by hand.
+  const timers = new Map();
+  let nextTimerId = 1;
+  world.pendingTimers = () => timers.size;
+  world.runTimers = () => {
+    const pending = [...timers.values()];
+    timers.clear();
+    for (const callback of pending) callback();
+  };
   const globals = {
     chrome,
+    fetch,
     WebSocket: FakeWebSocket,
-    setTimeout: noop,
-    clearTimeout: noop,
+    setTimeout: (callback) => {
+      const id = nextTimerId++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
     setInterval: noop,
     clearInterval: noop,
   };

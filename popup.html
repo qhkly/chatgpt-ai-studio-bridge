@@ -8,14 +8,35 @@
 <body>
   <header>AI Studio → ChatGPT Bridge</header>
 
-  <ul id="rows" aria-live="polite"></ul>
-  <p id="delivery" class="note" hidden></p>
+  <section id="status-view">
+    <ul id="rows" aria-live="polite"></ul>
+    <p id="delivery" class="note" hidden></p>
 
-  <div class="actions">
-    <button id="redetect" type="button">重新检测当前页面</button>
-    <button id="copy" type="button">复制诊断信息</button>
-  </div>
-  <p id="message" class="note" hidden></p>
+    <div id="remote" class="remote" hidden>
+      <span id="remote-dot" class="dot"></span>
+      <span id="remote-text" class="value"></span>
+      <button id="disconnect-remote" class="link" type="button">断开远程连接</button>
+    </div>
+    <button id="pair" class="primary" type="button" hidden>连接远程 AI Studio</button>
+
+    <div class="actions">
+      <button id="redetect" type="button">重新检测当前页面</button>
+      <button id="copy" type="button">复制诊断信息</button>
+    </div>
+    <p id="message" class="note" hidden></p>
+  </section>
+
+  <form id="pair-view" hidden novalidate>
+    <label for="pair-code">输入 AI Studio 中显示的 6 位配对码</label>
+    <input id="pair-code" type="text" inputmode="numeric" autocomplete="one-time-code"
+           maxlength="16" placeholder="123 456" spellcheck="false">
+    <button id="pair-submit" class="primary" type="submit">连接</button>
+    <p id="pair-message" class="note" hidden></p>
+    <div class="pair-footer">
+      <button id="pair-back" class="link" type="button">返回</button>
+      <button id="open-options" class="link" type="button">高级设置</button>
+    </div>
+  </form>
 
   <script type="module" src="src/popup.js"></script>
 </body>

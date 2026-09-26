@@ -1,4 +1,9 @@
 import {
+  describePairingError,
+  describeRemote,
+  normalizePairingCode,
+} from './pairing.js';
+import {
   describeDeliveryIssue,
   describeRedetect,
   describeSnapshot,
@@ -12,6 +17,18 @@ const deliveryEl = document.querySelector('#delivery');
 const messageEl = document.querySelector('#message');
 const redetectButton = document.querySelector('#redetect');
 const copyButton = document.querySelector('#copy');
+const statusView = document.querySelector('#status-view');
+const remoteEl = document.querySelector('#remote');
+const remoteDot = document.querySelector('#remote-dot');
+const remoteText = document.querySelector('#remote-text');
+const disconnectButton = document.querySelector('#disconnect-remote');
+const pairButton = document.querySelector('#pair');
+const pairView = document.querySelector('#pair-view');
+const pairCode = document.querySelector('#pair-code');
+const pairSubmit = document.querySelector('#pair-submit');
+const pairMessage = document.querySelector('#pair-message');
+const pairBack = document.querySelector('#pair-back');
+const openOptions = document.querySelector('#open-options');
 
 let activeTabId = null;
 let lastSnapshot = null;
@@ -52,6 +69,30 @@ const render = (snapshot) => {
   deliveryEl.textContent = delivery ? '角标 !：' + delivery : '';
   deliveryEl.className = 'note bad';
   deliveryEl.hidden = !delivery;
+
+  // The snapshot only says enabled/connected; the device token never
+  // reaches the popup.
+  const remote = describeRemote(snapshot);
+  remoteEl.hidden = remote.state === 'off';
+  remoteDot.className = 'dot ' + (remote.state === 'connected' ? 'ok' : 'warn');
+  remoteText.textContent = remote.text;
+  pairButton.hidden = !remote.offerPairing;
+};
+
+const showPairMessage = (text, tone = 'muted') => {
+  pairMessage.textContent = text;
+  pairMessage.className = 'note' + (tone === 'bad' ? ' bad' : '');
+  pairMessage.hidden = !text;
+};
+
+const showPairView = (visible) => {
+  statusView.hidden = visible;
+  pairView.hidden = !visible;
+  if (visible) {
+    showPairMessage('');
+    pairCode.value = '';
+    pairCode.focus();
+  }
 };
 
 const refresh = async () => {
@@ -110,6 +151,62 @@ copyButton.addEventListener('click', async () => {
   }
   const ok = await copyText(formatDiagnostics(lastSnapshot));
   showMessage(ok ? '诊断信息已复制' : '复制失败', ok ? 'muted' : 'bad');
+});
+
+pairButton.addEventListener('click', () => showPairView(true));
+pairBack.addEventListener('click', () => showPairView(false));
+openOptions.addEventListener('click', () => chrome.runtime.openOptionsPage());
+
+pairView.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const code = normalizePairingCode(pairCode.value);
+  if (!code) {
+    showPairMessage(describePairingError('invalid-format'), 'bad');
+    pairCode.focus();
+    return;
+  }
+
+  pairSubmit.disabled = true;
+  pairCode.disabled = true;
+  showPairMessage('连接中…');
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: 'aiStudio.popup.pairRemote',
+      code,
+    });
+    if (result?.ok) {
+      showPairView(false);
+      showMessage('配对成功');
+      await refresh();
+    } else {
+      showPairMessage(describePairingError(result?.reason), 'bad');
+    }
+  } catch {
+    showPairMessage(describePairingError('internal-error'), 'bad');
+  } finally {
+    pairSubmit.disabled = false;
+    pairCode.disabled = false;
+  }
+});
+
+disconnectButton.addEventListener('click', async () => {
+  disconnectButton.disabled = true;
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: 'aiStudio.popup.disconnectRemote',
+    });
+    showMessage(
+      result?.ok
+        ? '已在本机断开远程连接；如需吊销该设备，请在 AI Studio 设备列表中操作'
+        : '断开失败',
+      result?.ok ? 'muted' : 'bad',
+    );
+    await refresh();
+  } catch {
+    showMessage('断开失败', 'bad');
+  } finally {
+    disconnectButton.disabled = false;
+  }
 });
 
 const start = async () => {

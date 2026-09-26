@@ -55,6 +55,22 @@
 2. 先跑 `npm test`，再由 `scripts/release/package.mjs` 打包运行时必需文件为 `chatgpt-ai-studio-bridge.zip`（ZIP 根目录直接包含 `manifest.json`），计算 SHA256 并生成 `version.json`（最小字段：`version` / `downloadUrl` / `sha256` / `tag`，不做任何 commit 追踪）。
 3. 在该 Tag 对应的 GitHub Release 上传 ZIP 和 version.json。不维护固定的 `latest` Tag 或 `latest/version.json` 资产——获取最新版本请用 GitHub Releases 的 latest API（`/releases/latest`），下载地址取 Release 中的 `chatgpt-ai-studio-bridge.zip`，校验用同目录的 `version.json`。
 
+## 连接远程 AI Studio（配对）
+
+AI Studio 不在本机时（本地桥未连接且未配置远程中继），弹窗会显示 **连接远程 AI Studio**：
+
+1. 在 AI Studio 设备页生成 6 位配对码（一次性，5 分钟有效）。
+2. 在弹窗输入配对码（可带空格）点“连接”。扩展后台向 `https://notify.qhkly.com/v1/pairings/claim` 提交 `{code, deviceLabel}`，换取该浏览器专属的 `deviceToken` 和 `relayUrl`，写入 `chrome.storage.local` 并立即连接远程中继；弹窗显示“远程已连接”。
+3. 配对码过期/已使用/无效、格式错误、网络失败都会给出明确提示，不会改动现有设置。
+
+同机的 localhost 桥仍然优先；远程可同时在线，同一事件按 eventId 去重只发送一次。`deviceToken` 只存在于后台和本地存储，不会出现在弹窗、诊断信息或 console 中。
+
+**断开远程连接** 只清除本机保存的 token，不会在服务端吊销设备；吊销请在 AI Studio 设备列表中操作。
+
+在 AI Studio 设备列表吊销后，中继会发送 `{"type":"device.revoked"}` 控制帧或以 close code `4003` 断开：扩展立即关闭远程连接并停止重连；配对得到的 token 会从本机清除，弹窗回到“连接远程 AI Studio”。手工填写的 token 不会被清除，但在修改前不再重试。普通网络断开仍按原逻辑自动重连。
+
+手工填写 relay 地址 / token 仍可在扩展选项页（高级设置）完成。
+
 ## Remote relay
 
 The extension always keeps the localhost bridge as the fast path. When remote relay is enabled in Extension Options it also connects to the Cloudflare relay. eventId deduplication prevents the local and remote copies from sending the same ChatGPT message twice. Remote events are ACKed only after the ChatGPT page confirms the message was sent.
