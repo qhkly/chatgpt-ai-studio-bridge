@@ -274,6 +274,18 @@ const parseBridgeMessage = async (raw, source) => {
     return;
   }
   if (event?.type === 'pong') return;
+  if (event?.type === 'extension.reload') {
+    // AI Studio swapped the unpacked extension directory; pick it up without a
+    // manual reload on chrome://extensions. Skip when the version is unchanged
+    // so a stale broadcast cannot reload-loop the service worker.
+    if (
+      source === 'local' &&
+      (!event.version || event.version !== chrome.runtime.getManifest().version)
+    ) {
+      chrome.runtime.reload();
+    }
+    return;
+  }
 
   await enqueueCompletion(event, source);
 };
