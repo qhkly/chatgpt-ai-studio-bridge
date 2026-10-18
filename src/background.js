@@ -18,6 +18,9 @@ import {
 
 const REMOTE_SETTINGS_KEY = 'remoteRelay';
 const RECENT_EVENTS_KEY = 'recentEventIds';
+// Events whose send was started but not confirmed: 'inflight' while a tab
+// works on it, or the content script's terminal state once it stopped.
+const EVENT_ATTEMPTS_KEY = 'eventAttempts';
 const ROUTE_BINDINGS_KEY = 'routeBindings';
 const RECONNECT_MS = 3000;
 // Relay close code for a revoked / unknown device token.
@@ -94,10 +97,11 @@ const recordRedetect = (tabId, record) =>
     [tabId]: record,
   }));
 
-const recordDelivery = (outcome, routeId) =>
+const recordDelivery = (outcome, routeId, detail = null) =>
   updateSession(LAST_DELIVERY_KEY, () => ({
     outcome,
     routeId,
+    detail,
     at: Date.now(),
   }));
 
@@ -191,36 +195,89 @@ const ensureContentScript = async (tabId) => {
   }
 };
 
-const deliverCompletion = async (event) => {
+const getEventAttempt = async (key) => {
+  const stored = await chrome.storage.local.get(EVENT_ATTEMPTS_KEY);
+  return stored[EVENT_ATTEMPTS_KEY]?.[key] ?? null;
+};
+
+const setEventAttempt = async (key, attempt) => {
+  const stored = await chrome.storage.local.get(EVENT_ATTEMPTS_KEY);
+  const next = { ...(stored[EVENT_ATTEMPTS_KEY] ?? {}) };
+  if (attempt) next[key] = { ...attempt, at: Date.now() };
+  else delete next[key];
+  const kept = Object.entries(next)
+    .sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0))
+    .slice(0, MAX_RECENT_EVENTS);
+  await chrome.storage.local.set({ [EVENT_ATTEMPTS_KEY]: Object.fromEntries(kept) });
+};
+
+// The message never reached a listener, so nothing in the page moved.
+const isUndeliveredMessageError = (error) =>
+  /Could not establish connection|Receiving end does not exist/i.test(
+    String(error?.message ?? error),
+  );
+
+// Returns { outcome, detail }: 'delivered' (send confirmed in the page),
+// 'unmatched' / 'failed' (nothing was written; safe to retry), or 'stopped'
+// (an attempt started but was not confirmed; never retried).
+const deliverCompletion = async (event, key, previousAttempt) => {
   const tab = await findTabForRoute(event.routeId);
 
   if (!tab?.id) {
     console.warn('[AI Studio Bridge] No ChatGPT tab matches route', event.routeId);
     await recordDelivery('unmatched', event.routeId);
     await setBadge('!');
-    return 'unmatched';
+    return { outcome: 'unmatched' };
+  }
+
+  // A worker restart lost track of an attempt in another tab: its page
+  // record cannot vouch for this one, so sending here could duplicate it.
+  if (previousAttempt && previousAttempt.tabId !== tab.id) {
+    return { outcome: 'stopped', detail: 'inflight-in-other-tab' };
   }
 
   if (!(await ensureContentScript(tab.id))) {
     await recordDelivery('content-script-unavailable', event.routeId);
     await setBadge('!');
-    return 'failed';
+    return { outcome: 'failed' };
   }
 
-  let outcome;
+  // Persisted before the page can write anything, so a worker restart in the
+  // middle of a send finds it.
+  await setEventAttempt(key, { state: 'inflight', tabId: tab.id });
+
+  let result;
   try {
-    const result = await chrome.tabs.sendMessage(tab.id, {
+    result = await chrome.tabs.sendMessage(tab.id, {
       type: 'aiStudio.taskCompleted',
       prompt: buildCompletionPrompt(event),
+      eventKey: key,
       event,
     });
-    outcome = result?.ok === true ? 'delivered' : 'failed';
   } catch (error) {
-    console.error('[AI Studio Bridge] Failed to deliver completion event', error);
-    outcome = 'failed';
+    if (isUndeliveredMessageError(error)) {
+      console.error('[AI Studio Bridge] Failed to deliver completion event', error);
+      await setEventAttempt(key, null);
+      await recordDelivery('failed', event.routeId);
+      return { outcome: 'failed' };
+    }
+    // The page took the message but the channel closed before it answered
+    // (navigation, reload): whether it sent is unknown.
+    result = { ok: false, state: 'ambiguous', detail: 'channel-closed' };
   }
-  await recordDelivery(outcome, event.routeId);
-  return outcome;
+
+  if (result?.ok === true) {
+    await recordDelivery('delivered', event.routeId);
+    return { outcome: 'delivered' };
+  }
+  if (result?.retryable === true) {
+    await setEventAttempt(key, null);
+    await recordDelivery('failed', event.routeId, String(result.state));
+    return { outcome: 'failed' };
+  }
+  const detail = String(result?.state ?? 'no-response') +
+    (result?.detail ? ':' + String(result.detail) : '');
+  return { outcome: 'stopped', detail };
 };
 
 const hasDelivered = async (key) => {
@@ -272,13 +329,34 @@ const handleCompletion = async (event, source) => {
     return;
   }
 
-  const outcome = await deliverCompletion(event);
+  // A stopped attempt is final: replays (relay reconnect, the other source)
+  // are dropped, never re-sent. It is not ACKed — nothing proved a send.
+  const attempt = await getEventAttempt(key);
+  if (attempt && attempt.state !== 'inflight') {
+    console.warn('[AI Studio Bridge] Not re-sending an unconfirmed completion', {
+      eventKey: key,
+      state: attempt.state,
+    });
+    return;
+  }
+
+  const { outcome, detail } = await deliverCompletion(event, key, attempt);
   if (outcome === 'unmatched') {
     // Leave a remote event unacked in the relay. When this exact route is
     // later observed, saveRouteBinding recycles the socket and replay resumes.
     if (source === 'remote') {
       pendingRouteIds.add(event.routeId.trim().toLowerCase());
     }
+    return;
+  }
+  if (outcome === 'stopped') {
+    console.error('[AI Studio Bridge] Completion send unconfirmed; not retrying', {
+      eventKey: key,
+      detail,
+    });
+    await setEventAttempt(key, { state: 'stopped', detail });
+    await recordDelivery('stopped', event.routeId, detail);
+    await setBadge('!');
     return;
   }
   if (outcome !== 'delivered') {
@@ -290,6 +368,7 @@ const handleCompletion = async (event, source) => {
 
   pendingRouteIds.delete(event.routeId.trim().toLowerCase());
   await markDelivered(key);
+  await setEventAttempt(key, null);
   if (source === 'remote') ackRemote(event);
 };
 

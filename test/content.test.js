@@ -248,9 +248,11 @@ test('sendPrompt writes prompt + verified marker and clicks send once (textarea)
 
   const response = await sendTaskCompleted(world, '任务已完成，请继续审查');
 
-  assert.deepEqual(response, { ok: true });
+  assert.equal(response.ok, true);
+  assert.equal(response.state, 'sent');
   assert.equal(world.sendButton.clicks, 1);
-  const text = composerTextOf(world);
+  assert.equal(world.app.sent.length, 1);
+  const text = world.app.sent[0];
   assert.match(text, /任务已完成，请继续审查/);
   assert.deepEqual(markerIdsIn(text), [ROUTE_ID]);
   assert.equal(injectFailures(world).length, 0);
@@ -261,9 +263,9 @@ test('sendPrompt writes prompt + verified marker and clicks send once (Lexical c
 
   const response = await sendTaskCompleted(world, 'worker finished');
 
-  assert.deepEqual(response, { ok: true });
+  assert.equal(response.ok, true);
   assert.equal(world.sendButton.clicks, 1);
-  assert.deepEqual(markerIdsIn(composerTextOf(world)), [ROUTE_ID]);
+  assert.deepEqual(markerIdsIn(world.app.sent[0]), [ROUTE_ID]);
 });
 
 test('sendPrompt survives a re-render that reverts the marker asynchronously', async () => {
@@ -280,9 +282,10 @@ test('sendPrompt survives a re-render that reverts the marker asynchronously', a
 
   const response = await sendTaskCompleted(world, 'task done');
 
-  assert.deepEqual(response, { ok: true });
+  assert.equal(response.ok, true);
   assert.equal(world.sendButton.clicks, 1);
-  assert.deepEqual(markerIdsIn(composerTextOf(world)), [ROUTE_ID]);
+  assert.equal(world.app.sent.length, 1);
+  assert.deepEqual(markerIdsIn(world.app.sent[0]), [ROUTE_ID]);
 });
 
 test('sendPrompt never clicks send when the composer reverts every write', async () => {
@@ -293,7 +296,10 @@ test('sendPrompt never clicks send when the composer reverts every write', async
 
   const response = await sendTaskCompleted(world, 'task done');
 
-  assert.deepEqual(response, { ok: false });
+  assert.equal(response.ok, false);
+  assert.equal(response.state, 'inject-failed');
+  // Terminal: something was written, so the background must not retry.
+  assert.equal(response.retryable, false);
   assert.equal(world.sendButton.clicks, 0);
   const failures = injectFailures(world);
   assert.equal(failures.length, 1);

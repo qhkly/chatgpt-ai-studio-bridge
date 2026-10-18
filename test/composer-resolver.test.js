@@ -98,10 +98,12 @@ test('ProseMirror composer: sendPrompt writes, verifies and clicks the form send
 
   const response = await sendTaskCompleted(world, 'worker finished');
 
-  assert.deepEqual(response, { ok: true });
+  assert.equal(response.ok, true);
+  assert.equal(response.state, 'sent');
   assert.equal(world.sendButton.clicks, 1);
-  assert.match(composerTextOf(world), /worker finished/);
-  assert.deepEqual(markerIdsIn(composerTextOf(world)), [ROUTE_ID]);
+  assert.equal(world.app.sent.length, 1);
+  assert.match(world.app.sent[0], /worker finished/);
+  assert.deepEqual(markerIdsIn(world.app.sent[0]), [ROUTE_ID]);
 });
 
 // --- Candidate validation ----------------------------------------------------
@@ -151,8 +153,8 @@ test('an aria-hidden composer editor and a disabled composer textarea are never 
   });
 
   return sendTaskCompleted(world, 'done').then((response) => {
-    assert.deepEqual(response, { ok: true });
-    assert.deepEqual(markerIdsIn(composerTextOf(world)), [ROUTE_ID]);
+    assert.equal(response.ok, true);
+    assert.deepEqual(markerIdsIn(world.app.sent[0]), [ROUTE_ID]);
   });
 });
 
@@ -241,6 +243,7 @@ test('a bare submit button next to the composer is used; one in an unrelated for
   trailing.childNodes.length = 0;
   const submit = el('button', { type: 'submit' });
   trailing.appendChild(submit);
+  submit.onClick = () => world.app.submit();
   const loginSubmit = el('button', { type: 'submit' });
   world.document.body.appendChild(el('form', { action: '/login' }, [loginSubmit]));
 
@@ -253,7 +256,7 @@ test('a bare submit button next to the composer is used; one in an unrelated for
 
   setComposerText(world, '');
   const response = await sendTaskCompleted(world, 'next task');
-  assert.deepEqual(response, { ok: true });
+  assert.equal(response.ok, true);
   assert.equal(submit.clicks, 1);
   assert.equal(loginSubmit.clicks, 0);
 });
@@ -265,7 +268,7 @@ test('the send button nearest the composer wins over another one elsewhere on th
 
   const response = await sendTaskCompleted(world, 'task');
 
-  assert.deepEqual(response, { ok: true });
+  assert.equal(response.ok, true);
   assert.equal(world.sendButton.clicks, 1);
   assert.equal(elsewhere.clicks, 0);
 });

@@ -155,6 +155,8 @@ export const buildStatusSnapshot = ({
       routeIdOrNull(lastDelivery.routeId) === route.routeId
       ? {
           outcome: String(lastDelivery.outcome),
+          // Content-free state string (e.g. "unsent:send-disabled;clicks=0").
+          detail: typeof lastDelivery.detail === 'string' ? lastDelivery.detail : null,
           routeId: route.routeId,
           at: timestampOrNull(lastDelivery.at),
         }
@@ -215,6 +217,7 @@ const DELIVERY_TEXT = {
   unmatched: '完成事件找不到匹配 route 的 ChatGPT 标签页',
   'content-script-unavailable': '无法连接 ChatGPT 页面脚本',
   failed: '完成事件未能发送到 ChatGPT',
+  stopped: '完成通知未确认发出，已停止重试以免重复发送',
 };
 
 const formatClock = (at) => {
@@ -346,7 +349,9 @@ export const formatDiagnostics = (snapshot) => {
 
   lines.push(
     'last delivery: ' + (lastDelivery
-      ? lastDelivery.outcome + ' at=' + iso(lastDelivery.at) +
+      ? lastDelivery.outcome +
+        (lastDelivery.detail ? ' detail=' + lastDelivery.detail : '') +
+        ' at=' + iso(lastDelivery.at) +
         ' routeId=' + (lastDelivery.routeId ?? '-')
       : '-'),
   );

@@ -76,3 +76,17 @@ AI Studio 不在本机时（本地桥未连接且未配置远程中继），弹�
 The extension always keeps the localhost bridge as the fast path. When remote relay is enabled in Extension Options it also connects to the Cloudflare relay. eventId deduplication prevents the local and remote copies from sending the same ChatGPT message twice. Remote events are ACKed only after the ChatGPT page confirms the message was sent.
 
 The composer is never overwritten: if the user is typing, the notification waits until the composer is empty.
+
+## 自动发送状态机（防双发）
+
+每个完成事件（按 eventId）在页面里只走一次：
+
+1. **等待**：输入框为空且没有回复在生成才写入；60 秒内等不到 → `busy`，什么都没写，可重试。
+2. **填入**：写入通知 + route marker 并读回校验；marker 校验失败 → 撤回自己写的内容，`inject-failed`，不发送。
+3. **提交**：只有输入框里**仍然恰好是我们的文字**、发送按钮可用（`disabled`/`aria-disabled` 都不算）时才点击；按钮暂不可用时等待并补发 `input` 事件让 React 更新状态；点击前同一任务内再次校验/修复 marker。点击后 2 秒文字仍原样未动才视为没点上，最多点 3 次。
+4. **确认**：`click()` 本身不算成功。只有出现带这段通知的新用户消息（`[data-message-author-role="user"]`，与填入前的数量比较），或文字离开输入框后开始生成回复，才算 `sent`。
+
+停止条件（终态，不重试、不 ACK、角标 `!`，弹窗显示原因）：用户改了文字（`user-modified`，不再碰输入框）、用户删掉了文字（`cleared`）、45 秒内没能提交（`unsent`，文字留给用户手动发送）、点击后文字消失但没有发送证据（`unconfirmed`）、页面脚本回应前通道断开（`ambiguous`）。
+
+去重：页面用 sessionStorage 记录事件状态（只记 eventId 与状态，不记消息正文），重复投递/中继重放只返回已记录的结果，不会重新填写；后台在发送前把事件记为 `inflight`，终态记为 `stopped`，之后同一事件的本地/远程副本一律丢弃。远程事件只在确认发出后 ACK。
+

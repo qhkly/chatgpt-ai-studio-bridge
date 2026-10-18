@@ -118,7 +118,7 @@ test('snapshot keeps only the delivery for the current route', () => {
   const kept = buildStatusSnapshot(baseInput({
     lastDelivery: { outcome: 'failed', routeId: ROUTE_ID.toUpperCase(), at: 20 },
   }));
-  assert.deepEqual(kept.lastDelivery, { outcome: 'failed', routeId: ROUTE_ID, at: 20 });
+  assert.deepEqual(kept.lastDelivery, { outcome: 'failed', detail: null, routeId: ROUTE_ID, at: 20 });
 
   const stale = buildStatusSnapshot(baseInput({
     lastDelivery: { outcome: 'failed', routeId: OTHER_ROUTE_ID, at: 20 },

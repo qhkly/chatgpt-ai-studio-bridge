@@ -143,6 +143,7 @@ class FakeElement extends FakeNode {
 
   click() {
     this.clicks++;
+    this.onClick?.();
   }
 
   addEventListener(type, listener) {
@@ -315,9 +316,25 @@ const createWorld = ({ execCommand } = {}) => {
   return world;
 };
 
-const loadContentScript = () => {
+// Fast automated-send timing so state-machine tests finish in milliseconds.
+export const FAST_TIMING = {
+  waitEmptyMs: 400,
+  submitMs: 400,
+  pollMs: 5,
+  clickSettleMs: 40,
+  confirmMs: 80,
+  nudgeMs: 20,
+  maxClicks: 3,
+};
+
+const loadContentScript = (timing) => {
   const code = readFileSync(new URL('../../src/content.js', import.meta.url), 'utf8');
-  new Function(code)();
+  globalThis.__aiStudioBridgeTiming = timing;
+  try {
+    new Function(code)();
+  } finally {
+    delete globalThis.__aiStudioBridgeTiming;
+  }
 };
 
 const dispatchDocument = (world, type, target, init = {}) => {
@@ -381,7 +398,15 @@ const buildProseMirrorComposer = () => {
 // Builds a ChatGPT-like page — a composer (textarea, Lexical-style or
 // ProseMirror contenteditable) plus a send button — then executes the real
 // content script against it. `decorate(world)` may add extra DOM first.
-export const setupPage = ({ composer = 'textarea', execCommand, routeId, decorate } = {}) => {
+export const setupPage = ({
+  composer = 'textarea',
+  execCommand,
+  routeId,
+  decorate,
+  timing = FAST_TIMING,
+  // Simulated ChatGPT send behavior (installChatApp options), false for none.
+  app = {},
+} = {}) => {
   const world = createWorld({ execCommand });
 
   let root;
@@ -407,8 +432,9 @@ export const setupPage = ({ composer = 'textarea', execCommand, routeId, decorat
   if (routeId) world.setFixedRoute(routeId);
   else world.setFixedRoute('11111111-2222-3333-4444-555555555555');
 
+  if (app) world.app = installChatApp(world, app);
   decorate?.(world);
-  loadContentScript();
+  loadContentScript(timing);
   world.sentMessages.length = 0; // drop the initial registration burst
   return world;
 };
@@ -449,13 +475,13 @@ export const legacyMarkerIdsIn = (text) => idsMatching(LEGACY_MARKER_IDS_RE, tex
 
 // Drives the content script's chrome.runtime.onMessage listener the way the
 // background worker would for a completion notification.
-export const sendTaskCompleted = async (world, prompt) => {
+export const sendTaskCompleted = async (world, prompt, eventKey) => {
   const listener = world.messageListeners.find(
     (candidate) => candidate !== undefined,
   );
   return new Promise((resolve) => {
     const async = listener(
-      { type: 'aiStudio.taskCompleted', prompt },
+      { type: 'aiStudio.taskCompleted', prompt, eventKey },
       {},
       resolve,
     );
@@ -482,3 +508,52 @@ export const withPage = async (options, run) => {
     world.restoreGlobals();
   }
 };
+
+// --- Simulated ChatGPT app -------------------------------------------------
+// Enough of the real page's send behavior to verify delivery end-to-end: an
+// accepted send renders a [data-message-author-role="user"] turn with the
+// composer text, clears the composer, and (optionally) swaps in a stop
+// button while the reply streams. `accept()` decides whether a click takes.
+export const installChatApp = (world, { accept = () => true, stream = false } = {}) => {
+  const thread = el('div', { 'data-testid': 'thread' });
+  thread.ownerDocument = world.document;
+  world.document.body.appendChild(thread);
+  const app = { sent: [], thread, stopButton: null };
+
+  app.userTurns = () => thread.childNodes.length;
+
+  // The user's own send (Enter / click), same effect as an accepted click.
+  app.submit = () => {
+    const text = composerTextOf(world);
+    if (!text.trim()) return false;
+    app.sent.push(text);
+    const turn = el('div', { 'data-message-author-role': 'user' });
+    turn.textContent = text;
+    thread.appendChild(turn);
+    setComposerText(world, '');
+    if (stream) app.startReply();
+    return true;
+  };
+
+  app.startReply = () => {
+    if (app.stopButton) return;
+    app.stopButton = el('button', { 'data-testid': 'stop-button', 'aria-label': 'Stop' });
+    world.composerRoot.appendChild(app.stopButton);
+  };
+
+  app.finishReply = () => {
+    if (!app.stopButton) return;
+    const siblings = app.stopButton.parent.childNodes;
+    siblings.splice(siblings.indexOf(app.stopButton), 1);
+    app.stopButton = null;
+  };
+
+  world.sendButton.onClick = () => {
+    if (world.sendButton.disabled || app.stopButton) return;
+    if (accept(app)) app.submit();
+  };
+
+  return app;
+};
+
+export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

@@ -1,5 +1,24 @@
-const SEND_TIMEOUT_MS = 60000;
-const RETRY_MS = 300;
+// Automated-send timing. Tests shorten these through a content-script-world
+// global that the page itself cannot reach.
+const SEND_TIMING = {
+  // WAIT: how long a completion waits for an empty, idle composer. Nothing
+  // has been written yet, so giving up here is safe to retry.
+  waitEmptyMs: 60000,
+  // SUBMIT: how long the filled prompt may sit unsent before we stop and
+  // leave it to the user.
+  submitMs: 45000,
+  pollMs: 300,
+  // A click that left our text in place this long did not take.
+  clickSettleMs: 2000,
+  // Once our text left the composer, how long the sent user turn (or a
+  // started reply) may take to appear before the outcome is unconfirmed.
+  confirmMs: 8000,
+  // Re-announce the unchanged text so a framework that missed the first
+  // input event can enable the send button.
+  nudgeMs: 1000,
+  maxClicks: 3,
+  ...(globalThis.__aiStudioBridgeTiming ?? {}),
+};
 const ROUTE_SYNC_MS = 1000;
 // Automated sends can afford to wait one render cycle before trusting a
 // write: framework re-renders that revert the composer happen asynchronously.
@@ -535,35 +554,6 @@ const probeInjection = async () => {
   };
 };
 
-// Variant for automated sends, which can wait one render cycle: verify again
-// after a settle delay so an asynchronous framework re-render that reverted
-// the marker is caught instead of shipped.
-const injectRouteMarkerSettled = async (composer) => {
-  const result = injectRouteMarker(composer);
-  if (!result.ok) return result;
-
-  await sleep(MARKER_SETTLE_MS);
-
-  if (markerVerified(composer, result.routeId)) {
-    return result;
-  }
-
-  // The settle window reverted the marker. Rewrite and verify within the
-  // same task — the send that follows immediately cannot be raced by
-  // another render pass.
-  writePrompt(
-    composer,
-    buildTextWithMarker(composerRawText(composer), result.routeId),
-  );
-  if (markerVerified(composer, result.routeId)) {
-    reportInjectionOutcome(true, result.routeId);
-    return result;
-  }
-
-  reportInjectionOutcome(false, result.routeId, 'settled-readback-mismatch');
-  return { ok: false, routeId: result.routeId };
-};
-
 const reconcileRoute = () => {
   if (location.href === lastObservedUrl) return;
   lastObservedUrl = location.href;
@@ -575,39 +565,233 @@ const sleep = async (ms) =>
     setTimeout(resolve, ms);
   });
 
-const sendPrompt = async (prompt) => {
-  const deadline = Date.now() + SEND_TIMEOUT_MS;
+// --- Automated send: one state machine per completion event ----------------
+// WAIT (composer empty + idle) → FILL (prompt + verified marker) → SUBMIT
+// (click only while the composer still holds exactly our text) → CONFIRM
+// (the user turn renders or a reply starts). A click is never trusted on its
+// own, the user's text is never overwritten, and once anything was written
+// the event is never started again: a second attempt is how one notification
+// turns into two messages.
+const DELIVERY_RECORDS_KEY = 'aiStudio.deliveries';
+const MAX_DELIVERY_RECORDS = 50;
+// Nothing was written to the composer, so the background may retry.
+const RETRYABLE_DELIVERY_STATES = new Set(['busy', 'composer-not-found']);
+const USER_TURN_SELECTOR = '[data-message-author-role="user"]';
 
-  while (Date.now() < deadline) {
+// Per-tab record (sessionStorage survives reloads and content-script
+// re-injection) so a redelivered event is answered, not re-sent. Holds the
+// event key and a state only, never message text.
+const readDeliveryRecords = () => {
+  try {
+    const records = JSON.parse(storageGet(DELIVERY_RECORDS_KEY) ?? '{}');
+    return records && typeof records === 'object' ? records : {};
+  } catch {
+    return {};
+  }
+};
+
+const writeDeliveryRecord = (key, record) => {
+  const records = readDeliveryRecords();
+  if (record) records[key] = { ...record, at: Date.now() };
+  else delete records[key];
+  const kept = Object.entries(records)
+    .sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0))
+    .slice(0, MAX_DELIVERY_RECORDS);
+  storageSet(DELIVERY_RECORDS_KEY, JSON.stringify(Object.fromEntries(kept)));
+};
+
+const deliveryResult = (state, detail = null) => ({
+  ok: state === 'sent',
+  state,
+  retryable: RETRYABLE_DELIVERY_STATES.has(state),
+  detail,
+});
+
+const squashSpace = (text) => text.replace(/\s+/g, '');
+
+// Where our prompt stands in the composer. Whitespace is ignored because
+// rich editors turn "\n\n" into paragraphs whose textContent has no newline.
+const composerHolding = (composer, prompt) => {
+  if (!composer) return 'missing';
+  const text = squashSpace(nonMarkerText(composer));
+  if (text === '') return 'empty';
+  return text === squashSpace(prompt) ? 'ours' : 'other';
+};
+
+// Rendered user turns carrying this prompt. Compared against a baseline taken
+// before the fill, because the same task can complete (and notify) twice.
+const sentTurnCount = (prompt) => {
+  const needle = squashSpace(prompt);
+  return queryAll(document, USER_TURN_SELECTOR)
+    .filter((turn) => squashSpace(turn.textContent ?? '').includes(needle))
+    .length;
+};
+
+const isGenerating = () =>
+  queryAll(document, 'button').some((button) =>
+    isStopButton(button) && button.isConnected && !isHiddenElement(button));
+
+const isSendEnabled = (button) =>
+  !button.disabled &&
+  button.getAttribute('disabled') === null &&
+  button.getAttribute('aria-disabled') !== 'true';
+
+const nudgeComposer = (composer) => {
+  composer.dispatchEvent(new Event('input', { bubbles: true }));
+};
+
+const waitForIdleComposer = async () => {
+  const deadline = Date.now() + SEND_TIMING.waitEmptyMs;
+  for (;;) {
     const composer = findComposer();
+    const busy = composer && (nonMarkerText(composer) !== '' || isGenerating());
+    if (composer && !busy) return { composer };
+    if (Date.now() >= deadline) {
+      if (!composer) return { state: 'composer-not-found', detail: composerNotFoundDetail() };
+      return { state: 'busy', detail: isGenerating() ? 'reply-streaming' : 'composer-has-text' };
+    }
+    await sleep(SEND_TIMING.pollMs);
+  }
+};
 
-    if (composer && composerText(composer) === '') {
-      writePrompt(composer, prompt);
-      const injection = await injectRouteMarkerSettled(composer);
+// Fill failed: take back exactly what we wrote (and nothing else), so a
+// half-written notification cannot be sent later without its marker.
+const retractFill = (prompt, detail) => {
+  const composer = findComposer();
+  const holding = composerHolding(composer, prompt);
+  if (holding === 'other') return detail + ';left-user-text';
+  if (holding === 'missing' || composerRawText(composer).trim() === '') return detail;
+  return clearComposer(composer) ? detail : detail + ';cleanup-failed';
+};
 
-      if (!injection.ok) {
-        // Never click send without a verified marker: an unroutable message
-        // is worse than a visible failure (badge "!").
-        return false;
+const submitFilledPrompt = async (prompt, baseline) => {
+  const deadline = Date.now() + SEND_TIMING.submitMs;
+  let clicks = 0;
+  let lastClickAt = 0;
+  let lastNudgeAt = Date.now();
+  let leftAt = 0;
+
+  for (;;) {
+    // A new user turn with this prompt is the proof, whoever pressed send.
+    if (sentTurnCount(prompt) > baseline) {
+      return { state: 'sent', detail: clicks ? 'clicks=' + clicks : 'manual' };
+    }
+
+    const composer = findComposer();
+    const holding = composerHolding(composer, prompt);
+
+    if (holding === 'other') {
+      // The user edited the notification: it is theirs now. Never click,
+      // never rewrite.
+      return { state: 'user-modified', detail: 'clicks=' + clicks };
+    }
+
+    if (holding === 'ours') {
+      leftAt = 0;
+      const settling = clicks > 0 && Date.now() - lastClickAt < SEND_TIMING.clickSettleMs;
+      const button = findSendButton(composer);
+      if (!settling && clicks < SEND_TIMING.maxClicks && button &&
+          isSendEnabled(button) && !isGenerating()) {
+        // Pre-send read-back, repaired within the same task as the click.
+        if (!injectRouteMarker(composer).ok) {
+          return { state: 'inject-failed', detail: retractFill(prompt, 'pre-send-readback-mismatch') };
+        }
+        button.click();
+        clicks++;
+        lastClickAt = Date.now();
+      } else if (!settling && Date.now() - lastNudgeAt >= SEND_TIMING.nudgeMs) {
+        nudgeComposer(composer);
+        lastNudgeAt = Date.now();
       }
-
-      // Final read-back immediately before triggering the send action.
-      if (!markerVerified(composer, injection.routeId)) {
-        reportInjectionOutcome(false, injection.routeId, 'pre-send-readback-mismatch');
-        return false;
+      if (Date.now() >= deadline) {
+        // Still sitting in the composer: leave it to the user. Retrying
+        // later would race their own send.
+        const why = !button ? 'no-send-button' : !isSendEnabled(button) ? 'send-disabled' : 'not-accepted';
+        return { state: 'unsent', detail: why + ';clicks=' + clicks };
       }
-
-      const sendButton = findSendButton(composer);
-      if (sendButton && !sendButton.disabled) {
-        sendButton.click();
-        return true;
+    } else {
+      // Our text left the composer (sent, or removed by the user). A reply
+      // starting is evidence of a send; otherwise wait for the turn.
+      leftAt ||= Date.now();
+      if (isGenerating()) {
+        return { state: 'sent', detail: (clicks ? 'clicks=' + clicks : 'manual') + ';reply-started' };
+      }
+      if (Date.now() - leftAt >= SEND_TIMING.confirmMs) {
+        return clicks
+          ? { state: 'unconfirmed', detail: 'composer-cleared-after-click;clicks=' + clicks }
+          : { state: 'cleared', detail: 'composer-cleared-without-send' };
       }
     }
 
-    await sleep(RETRY_MS);
+    await sleep(SEND_TIMING.pollMs);
+  }
+};
+
+const runDelivery = async (prompt, key) => {
+  const finish = ({ state, detail = null }) => {
+    const result = deliveryResult(state, detail);
+    if (key) {
+      writeDeliveryRecord(key, result.retryable ? null : { state, detail });
+    }
+    if (!result.ok) {
+      console.warn('[AI Studio Bridge] Completion not sent', { state, detail });
+    }
+    return result;
+  };
+
+  const idle = await waitForIdleComposer();
+  if (!idle.composer) return finish(idle);
+
+  const { composer } = idle;
+  // Recorded before the first write: from here on this event is never
+  // started again, only answered.
+  if (key) writeDeliveryRecord(key, { state: 'pending' });
+  const baseline = sentTurnCount(prompt);
+
+  writePrompt(composer, prompt);
+  const injection = injectRouteMarker(composer);
+  if (!injection.ok) {
+    // Never submit without a verified marker: an unroutable message is worse
+    // than a visible failure (badge "!").
+    return finish({ state: 'inject-failed', detail: retractFill(prompt, injection.detail) });
+  }
+  if (composerHolding(composer, prompt) !== 'ours') {
+    return finish({ state: 'inject-failed', detail: retractFill(prompt, 'prompt-not-written') });
   }
 
-  return false;
+  // Let one render cycle pass before the first click. A re-render that
+  // reverted the marker is repaired right before the click (same task);
+  // anything the user did meanwhile is classified, never written over.
+  await sleep(MARKER_SETTLE_MS);
+  return finish(await submitFilledPrompt(prompt, baseline));
+};
+
+const activeDeliveries = new Map();
+let deliveryChain = Promise.resolve();
+
+// One delivery at a time per tab, and one run per event key: a concurrent
+// copy joins the running attempt, a later copy gets the recorded outcome.
+const deliverCompletion = (prompt, key) => {
+  if (key) {
+    const running = activeDeliveries.get(key);
+    if (running) return running;
+    const record = readDeliveryRecords()[key];
+    if (record) {
+      // 'pending' without a running job: a previous instance of this script
+      // (extension reload) owned the attempt and its fate is unknown.
+      return Promise.resolve(record.state === 'pending'
+        ? deliveryResult('ambiguous', 'orphaned-attempt')
+        : { ...deliveryResult(record.state, record.detail), retryable: false });
+    }
+  }
+
+  const job = deliveryChain.then(() => runDelivery(prompt, key));
+  deliveryChain = job.catch(() => {});
+  if (key) {
+    activeDeliveries.set(key, job);
+    job.finally(() => activeDeliveries.delete(key)).catch(() => {});
+  }
+  return job;
 };
 
 // A precise send button anywhere, or a bare submit button that shares the
@@ -706,11 +890,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type !== 'aiStudio.taskCompleted') return undefined;
 
-  sendPrompt(message.prompt)
-    .then((ok) => sendResponse({ ok }))
+  const key = typeof message.eventKey === 'string' && message.eventKey
+    ? message.eventKey
+    : null;
+  deliverCompletion(message.prompt, key)
+    .then(sendResponse)
     .catch((error) => {
       console.error('[AI Studio Bridge] Failed to send prompt', error);
-      sendResponse({ ok: false });
+      // Unknown how far it got: never invite a retry.
+      sendResponse(deliveryResult('ambiguous', 'internal-error'));
     });
 
   return true;
