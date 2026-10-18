@@ -4,19 +4,20 @@ const SEND_TIMING = {
   // WAIT: how long a completion waits for an empty, idle composer. Nothing
   // has been written yet, so giving up here is safe to retry.
   waitEmptyMs: 60000,
-  // SUBMIT: how long the filled prompt may sit unsent before we stop and
-  // leave it to the user.
+  // SUBMIT: how long the filled prompt may wait for a usable send button
+  // before we stop and leave it to the user. No click has happened yet.
   submitMs: 45000,
   pollMs: 300,
-  // A click that left our text in place this long did not take.
-  clickSettleMs: 2000,
+  // After THE click (there is only ever one per event): how long ChatGPT may
+  // take to show the sent turn or start a reply. A slow page is not a reason
+  // to click again; past this the outcome is unconfirmed and the draft stays.
+  clickConfirmMs: 30000,
   // Once our text left the composer, how long the sent user turn (or a
   // started reply) may take to appear before the outcome is unconfirmed.
   confirmMs: 8000,
   // Re-announce the unchanged text so a framework that missed the first
-  // input event can enable the send button.
+  // input event can enable the send button. Only before the click.
   nudgeMs: 1000,
-  maxClicks: 3,
   ...(globalThis.__aiStudioBridgeTiming ?? {}),
 };
 const ROUTE_SYNC_MS = 1000;
@@ -573,7 +574,11 @@ const sleep = async (ms) =>
 // the event is never started again: a second attempt is how one notification
 // turns into two messages.
 const DELIVERY_RECORDS_KEY = 'aiStudio.deliveries';
-const MAX_DELIVERY_RECORDS = 50;
+// The background ledger (event-ledger.js) is the primary replay guard; these
+// records only answer re-asks to this tab. Same time bound as the ledger,
+// a smaller count (one tab's share), a few dozen KB at most.
+const DELIVERY_RECORD_TTL_MS = 8 * 24 * 60 * 60 * 1000;
+const MAX_DELIVERY_RECORDS = 500;
 // Nothing was written to the composer, so the background may retry.
 const RETRYABLE_DELIVERY_STATES = new Set(['busy', 'composer-not-found']);
 const USER_TURN_SELECTOR = '[data-message-author-role="user"]';
@@ -591,10 +596,12 @@ const readDeliveryRecords = () => {
 };
 
 const writeDeliveryRecord = (key, record) => {
+  const now = Date.now();
   const records = readDeliveryRecords();
-  if (record) records[key] = { ...record, at: Date.now() };
+  if (record) records[key] = { ...record, at: now };
   else delete records[key];
   const kept = Object.entries(records)
+    .filter(([, value]) => now - Number(value?.at || 0) <= DELIVERY_RECORD_TTL_MS)
     .sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0))
     .slice(0, MAX_DELIVERY_RECORDS);
   storageSet(DELIVERY_RECORDS_KEY, JSON.stringify(Object.fromEntries(kept)));
@@ -664,17 +671,23 @@ const retractFill = (prompt, detail) => {
   return clearComposer(composer) ? detail : detail + ';cleanup-failed';
 };
 
+// At most ONE click per event. Before it, waiting and nudging are free:
+// nothing can have been sent. After it, ChatGPT may have accepted the send
+// even if the page shows nothing for seconds (slow React render, network),
+// so a second click could post the message twice. From then on we only
+// watch; if nothing proves the send, the event stops as unconfirmed and the
+// draft (if still there) is left for the user.
 const submitFilledPrompt = async (prompt, baseline) => {
-  const deadline = Date.now() + SEND_TIMING.submitMs;
-  let clicks = 0;
-  let lastClickAt = 0;
+  const submitDeadline = Date.now() + SEND_TIMING.submitMs;
+  let clickedAt = 0;
   let lastNudgeAt = Date.now();
   let leftAt = 0;
+  const attempt = () => (clickedAt ? 'clicked' : 'manual');
 
   for (;;) {
     // A new user turn with this prompt is the proof, whoever pressed send.
     if (sentTurnCount(prompt) > baseline) {
-      return { state: 'sent', detail: clicks ? 'clicks=' + clicks : 'manual' };
+      return { state: 'sent', detail: attempt() };
     }
 
     const composer = findComposer();
@@ -683,42 +696,52 @@ const submitFilledPrompt = async (prompt, baseline) => {
     if (holding === 'other') {
       // The user edited the notification: it is theirs now. Never click,
       // never rewrite.
-      return { state: 'user-modified', detail: 'clicks=' + clicks };
+      return { state: 'user-modified', detail: clickedAt ? 'after-click' : 'before-click' };
     }
 
     if (holding === 'ours') {
       leftAt = 0;
-      const settling = clicks > 0 && Date.now() - lastClickAt < SEND_TIMING.clickSettleMs;
-      const button = findSendButton(composer);
-      if (!settling && clicks < SEND_TIMING.maxClicks && button &&
-          isSendEnabled(button) && !isGenerating()) {
-        // Pre-send read-back, repaired within the same task as the click.
-        if (!injectRouteMarker(composer).ok) {
-          return { state: 'inject-failed', detail: retractFill(prompt, 'pre-send-readback-mismatch') };
+      if (clickedAt) {
+        if (Date.now() - clickedAt >= SEND_TIMING.clickConfirmMs) {
+          return { state: 'unconfirmed', detail: 'click-not-confirmed;draft-kept' };
         }
-        button.click();
-        clicks++;
-        lastClickAt = Date.now();
-      } else if (!settling && Date.now() - lastNudgeAt >= SEND_TIMING.nudgeMs) {
-        nudgeComposer(composer);
-        lastNudgeAt = Date.now();
-      }
-      if (Date.now() >= deadline) {
-        // Still sitting in the composer: leave it to the user. Retrying
-        // later would race their own send.
-        const why = !button ? 'no-send-button' : !isSendEnabled(button) ? 'send-disabled' : 'not-accepted';
-        return { state: 'unsent', detail: why + ';clicks=' + clicks };
+      } else {
+        const button = findSendButton(composer);
+        if (button && isSendEnabled(button) && !isGenerating()) {
+          // Pre-send read-back, repaired within the same task as the click.
+          if (!injectRouteMarker(composer).ok) {
+            return {
+              state: 'inject-failed',
+              detail: retractFill(prompt, 'pre-send-readback-mismatch'),
+            };
+          }
+          button.click();
+          clickedAt = Date.now();
+        } else if (Date.now() >= submitDeadline) {
+          // Never clicked: leave it to the user. A retry later would race
+          // their own send.
+          return {
+            state: 'unsent',
+            detail: !button ? 'no-send-button' : !isSendEnabled(button) ? 'send-disabled' : 'reply-streaming',
+          };
+        } else if (Date.now() - lastNudgeAt >= SEND_TIMING.nudgeMs) {
+          nudgeComposer(composer);
+          lastNudgeAt = Date.now();
+        }
       }
     } else {
       // Our text left the composer (sent, or removed by the user). A reply
       // starting is evidence of a send; otherwise wait for the turn.
       leftAt ||= Date.now();
       if (isGenerating()) {
-        return { state: 'sent', detail: (clicks ? 'clicks=' + clicks : 'manual') + ';reply-started' };
+        return { state: 'sent', detail: attempt() + ';reply-started' };
       }
-      if (Date.now() - leftAt >= SEND_TIMING.confirmMs) {
-        return clicks
-          ? { state: 'unconfirmed', detail: 'composer-cleared-after-click;clicks=' + clicks }
+      const confirmWindow = clickedAt
+        ? Math.max(SEND_TIMING.confirmMs, clickedAt + SEND_TIMING.clickConfirmMs - leftAt)
+        : SEND_TIMING.confirmMs;
+      if (Date.now() - leftAt >= confirmWindow) {
+        return clickedAt
+          ? { state: 'unconfirmed', detail: 'composer-cleared-after-click' }
           : { state: 'cleared', detail: 'composer-cleared-without-send' };
       }
     }
@@ -771,7 +794,7 @@ let deliveryChain = Promise.resolve();
 
 // One delivery at a time per tab, and one run per event key: a concurrent
 // copy joins the running attempt, a later copy gets the recorded outcome.
-const deliverCompletion = (prompt, key) => {
+const deliverCompletion = (prompt, key, resume = false) => {
   if (key) {
     const running = activeDeliveries.get(key);
     if (running) return running;
@@ -782,6 +805,12 @@ const deliverCompletion = (prompt, key) => {
       return Promise.resolve(record.state === 'pending'
         ? deliveryResult('ambiguous', 'orphaned-attempt')
         : { ...deliveryResult(record.state, record.detail), retryable: false });
+    }
+    if (resume) {
+      // The background began this event earlier and lost track (worker
+      // restart, browser restart). No record here does not prove nothing
+      // was sent (records expire, sessionStorage can be lost), so stop.
+      return Promise.resolve(deliveryResult('ambiguous', 'no-record-for-resumed-attempt'));
     }
   }
 
@@ -893,7 +922,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const key = typeof message.eventKey === 'string' && message.eventKey
     ? message.eventKey
     : null;
-  deliverCompletion(message.prompt, key)
+  deliverCompletion(message.prompt, key, message.resume === true)
     .then(sendResponse)
     .catch((error) => {
       console.error('[AI Studio Bridge] Failed to send prompt', error);

@@ -321,10 +321,9 @@ export const FAST_TIMING = {
   waitEmptyMs: 400,
   submitMs: 400,
   pollMs: 5,
-  clickSettleMs: 40,
+  clickConfirmMs: 200,
   confirmMs: 80,
   nudgeMs: 20,
-  maxClicks: 3,
 };
 
 const loadContentScript = (timing) => {
@@ -514,7 +513,14 @@ export const withPage = async (options, run) => {
 // accepted send renders a [data-message-author-role="user"] turn with the
 // composer text, clears the composer, and (optionally) swaps in a stop
 // button while the reply streams. `accept()` decides whether a click takes.
-export const installChatApp = (world, { accept = () => true, stream = false } = {}) => {
+// `latencyMs` delays an accepted send (the page shows nothing until then);
+// `clearFirst` clears the composer at once and renders the turn late.
+export const installChatApp = (world, {
+  accept = () => true,
+  stream = false,
+  latencyMs = 0,
+  clearFirst = false,
+} = {}) => {
   const thread = el('div', { 'data-testid': 'thread' });
   thread.ownerDocument = world.document;
   world.document.body.appendChild(thread);
@@ -548,9 +554,26 @@ export const installChatApp = (world, { accept = () => true, stream = false } = 
     app.stopButton = null;
   };
 
+  app.accepted = 0;
   world.sendButton.onClick = () => {
     if (world.sendButton.disabled || app.stopButton) return;
-    if (accept(app)) app.submit();
+    if (!accept(app)) return;
+    app.accepted++;
+    if (!latencyMs) {
+      app.submit();
+      return;
+    }
+    // Each accepted click is a real send, however late it shows up.
+    const text = composerTextOf(world);
+    if (clearFirst) setComposerText(world, '');
+    setTimeout(() => {
+      app.sent.push(text);
+      const turn = el('div', { 'data-message-author-role': 'user' });
+      turn.textContent = text;
+      thread.appendChild(turn);
+      if (composerTextOf(world) === text) setComposerText(world, '');
+      if (stream) app.startReply();
+    }, latencyMs);
   };
 
   return app;

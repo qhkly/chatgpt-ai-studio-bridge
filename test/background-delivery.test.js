@@ -69,6 +69,9 @@ const openRemote = async (world) => {
   return socket;
 };
 
+const ledger = async (world) =>
+  (await world.chrome.storage.local.get('eventLedger')).eventLedger ?? {};
+
 const lastDelivery = async (world) =>
   (await world.chrome.storage.session.get('lastDelivery')).lastDelivery;
 
@@ -82,8 +85,8 @@ test('a confirmed send is ACKed once and the event key reaches the page', withBa
   assert.equal(calls.length, 1);
   assert.equal(calls[0].eventKey, 'evt-1');
   assert.deepEqual(acks(socket).map((frame) => frame.eventId), ['evt-1']);
-  const stored = await world.chrome.storage.local.get('eventAttempts');
-  assert.deepEqual(stored.eventAttempts, {});
+  assert.equal(calls[0].resume, false);
+  assert.equal((await ledger(world))['evt-1'].state, 'delivered');
 }));
 
 test('an unconfirmed attempt is not ACKed, not retried, and replays are dropped', withBackground(REMOTE, async (world, logs) => {
@@ -166,14 +169,13 @@ test('a message that never reached the page is a plain retryable failure', withB
 
   assert.equal(calls.length, 1);
   assert.equal(socket.readyState, 3);
-  const stored = await world.chrome.storage.local.get('eventAttempts');
-  assert.deepEqual(stored.eventAttempts, {});
+  assert.deepEqual(await ledger(world), {}, 'nothing written: no tombstone');
 }));
 
 test('after a worker restart an in-flight event is re-asked of the same tab only', withBackground({
   local: {
     ...RELAY,
-    eventAttempts: { 'evt-1': { state: 'inflight', tabId: 7, at: Date.now() } },
+    eventLedger: { 'evt-1': { state: 'inflight', tabId: 7, at: Date.now() } },
   },
 }, async (world) => {
   // The page answers from its own record (it already sent this event).
@@ -185,13 +187,14 @@ test('after a worker restart an in-flight event is re-asked of the same tab only
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].eventKey, 'evt-1');
+  assert.equal(calls[0].resume, true, 'the page must not start a fresh send');
   assert.deepEqual(acks(socket).map((frame) => frame.eventId), ['evt-1']);
 }));
 
 test('an in-flight event owned by another (gone) tab is stopped, not sent to this one', withBackground({
   local: {
     ...RELAY,
-    eventAttempts: { 'evt-1': { state: 'inflight', tabId: 99, at: Date.now() } },
+    eventLedger: { 'evt-1': { state: 'inflight', tabId: 99, at: Date.now() } },
   },
 }, async (world) => {
   const calls = contentScript(world, () => ({ ok: true, state: 'sent', retryable: false }));
@@ -237,4 +240,47 @@ test('a page response without a retryable flag is never treated as safe to retry
 
   assert.equal(calls.length, 1);
   assert.equal(socket.readyState, 1);
+}));
+
+// --- Tombstone retention vs. relay replay --------------------------------------
+
+test('a stopped event stays stopped after hundreds of newer events, then a replay', withBackground(REMOTE, async (world) => {
+  // The old 100-entry cap evicted the tombstone here and the replay re-sent.
+  const calls = contentScript(world, (message) => (message.eventKey === 'evt-stopped'
+    ? { ok: false, state: 'unconfirmed', retryable: false, detail: 'click-not-confirmed;draft-kept' }
+    : { ok: true, state: 'sent', retryable: false }));
+  const socket = await openRemote(world);
+
+  socket._fire('message', { data: event('evt-stopped') });
+  await flush();
+  for (let i = 0; i < 600; i++) {
+    socket._fire('message', { data: event('evt-' + i) });
+    await flush(4);
+  }
+  await flush(60);
+  assert.equal(calls.length, 601);
+
+  // Relay reconnect replays everything it still holds unACKed.
+  socket._fire('message', { data: event('evt-stopped') });
+  socket._fire('message', { data: event('evt-3') });
+  await flush(60);
+
+  assert.equal(calls.filter((message) => message.eventKey === 'evt-stopped').length, 1);
+  assert.equal(calls.filter((message) => message.eventKey === 'evt-3').length, 1);
+  assert.equal(acks(socket).filter((frame) => frame.eventId === 'evt-stopped').length, 0);
+  assert.equal(acks(socket).filter((frame) => frame.eventId === 'evt-3').length, 2,
+    'a delivered replay is re-ACKed (its first ACK may have been lost)');
+}));
+
+test('delivered ids from the pre-ledger list are still honoured after an upgrade', withBackground({
+  local: { ...RELAY, recentEventIds: ['evt-old'] },
+}, async (world) => {
+  const calls = contentScript(world, () => ({ ok: true, state: 'sent', retryable: false }));
+  const socket = await openRemote(world);
+
+  socket._fire('message', { data: event('evt-old') });
+  await flush();
+
+  assert.equal(calls.length, 0);
+  assert.deepEqual(acks(socket).map((frame) => frame.eventId), ['evt-old']);
 }));

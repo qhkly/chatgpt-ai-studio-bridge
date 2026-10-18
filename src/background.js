@@ -1,4 +1,5 @@
 import { createBadgeState } from './badge.js';
+import { withLedgerEntry } from './event-ledger.js';
 import { claimPairing } from './pairing.js';
 import {
   DEFAULT_BRIDGE_URL,
@@ -17,16 +18,17 @@ import {
 } from './status.js';
 
 const REMOTE_SETTINGS_KEY = 'remoteRelay';
-const RECENT_EVENTS_KEY = 'recentEventIds';
-// Events whose send was started but not confirmed: 'inflight' while a tab
-// works on it, or the content script's terminal state once it stopped.
-const EVENT_ATTEMPTS_KEY = 'eventAttempts';
+// Per-event delivery state (inflight / delivered / stopped); see
+// event-ledger.js for why and how long entries are kept.
+const EVENT_LEDGER_KEY = 'eventLedger';
+// Pre-ledger installs listed delivered event ids here. Still honoured after
+// an upgrade so those events are not sent again; never written.
+const LEGACY_RECENT_EVENTS_KEY = 'recentEventIds';
 const ROUTE_BINDINGS_KEY = 'routeBindings';
 const RECONNECT_MS = 3000;
 // Relay close code for a revoked / unknown device token.
 const REMOTE_REVOKED_CLOSE_CODE = 4003;
 const PING_MS = 20000;
-const MAX_RECENT_EVENTS = 100;
 const MAX_ROUTE_BINDINGS = 300;
 const ROUTE_TTL_MS = 24 * 60 * 60 * 1000;
 // Popup status lives in chrome.storage.session: it survives service-worker
@@ -195,20 +197,22 @@ const ensureContentScript = async (tabId) => {
   }
 };
 
-const getEventAttempt = async (key) => {
-  const stored = await chrome.storage.local.get(EVENT_ATTEMPTS_KEY);
-  return stored[EVENT_ATTEMPTS_KEY]?.[key] ?? null;
+const getLedgerEntry = async (key) => {
+  const stored = await chrome.storage.local.get(EVENT_LEDGER_KEY);
+  const entry = stored[EVENT_LEDGER_KEY]?.[key];
+  if (entry) return entry;
+  const legacy = await chrome.storage.local.get(LEGACY_RECENT_EVENTS_KEY);
+  return (legacy[LEGACY_RECENT_EVENTS_KEY] ?? []).includes(key)
+    ? { state: 'delivered' }
+    : null;
 };
 
-const setEventAttempt = async (key, attempt) => {
-  const stored = await chrome.storage.local.get(EVENT_ATTEMPTS_KEY);
-  const next = { ...(stored[EVENT_ATTEMPTS_KEY] ?? {}) };
-  if (attempt) next[key] = { ...attempt, at: Date.now() };
-  else delete next[key];
-  const kept = Object.entries(next)
-    .sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0))
-    .slice(0, MAX_RECENT_EVENTS);
-  await chrome.storage.local.set({ [EVENT_ATTEMPTS_KEY]: Object.fromEntries(kept) });
+// Callers are serialized by deliveryQueue, so read-modify-write is safe.
+const setLedgerEntry = async (key, entry) => {
+  const stored = await chrome.storage.local.get(EVENT_LEDGER_KEY);
+  await chrome.storage.local.set({
+    [EVENT_LEDGER_KEY]: withLedgerEntry(stored[EVENT_LEDGER_KEY], key, entry),
+  });
 };
 
 // The message never reached a listener, so nothing in the page moved.
@@ -244,7 +248,7 @@ const deliverCompletion = async (event, key, previousAttempt) => {
 
   // Persisted before the page can write anything, so a worker restart in the
   // middle of a send finds it.
-  await setEventAttempt(key, { state: 'inflight', tabId: tab.id });
+  await setLedgerEntry(key, { state: 'inflight', tabId: tab.id });
 
   let result;
   try {
@@ -252,12 +256,15 @@ const deliverCompletion = async (event, key, previousAttempt) => {
       type: 'aiStudio.taskCompleted',
       prompt: buildCompletionPrompt(event),
       eventKey: key,
+      // Re-asking about an attempt a previous worker started: the page must
+      // answer from its record and never start a fresh send.
+      resume: Boolean(previousAttempt),
       event,
     });
   } catch (error) {
     if (isUndeliveredMessageError(error)) {
       console.error('[AI Studio Bridge] Failed to deliver completion event', error);
-      await setEventAttempt(key, null);
+      await setLedgerEntry(key, null);
       await recordDelivery('failed', event.routeId);
       return { outcome: 'failed' };
     }
@@ -271,28 +278,13 @@ const deliverCompletion = async (event, key, previousAttempt) => {
     return { outcome: 'delivered' };
   }
   if (result?.retryable === true) {
-    await setEventAttempt(key, null);
+    await setLedgerEntry(key, null);
     await recordDelivery('failed', event.routeId, String(result.state));
     return { outcome: 'failed' };
   }
   const detail = String(result?.state ?? 'no-response') +
     (result?.detail ? ':' + String(result.detail) : '');
   return { outcome: 'stopped', detail };
-};
-
-const hasDelivered = async (key) => {
-  const stored = await chrome.storage.local.get(RECENT_EVENTS_KEY);
-  const recent = stored[RECENT_EVENTS_KEY] ?? [];
-  return recent.includes(key);
-};
-
-const markDelivered = async (key) => {
-  const stored = await chrome.storage.local.get(RECENT_EVENTS_KEY);
-  const recent = stored[RECENT_EVENTS_KEY] ?? [];
-  const next = [key, ...recent.filter((value) => value !== key)]
-    .slice(0, MAX_RECENT_EVENTS);
-
-  await chrome.storage.local.set({ [RECENT_EVENTS_KEY]: next });
 };
 
 const ackRemote = (event) => {
@@ -324,14 +316,14 @@ const handleCompletion = async (event, source) => {
   }
 
   const key = eventKey(event);
-  if (await hasDelivered(key)) {
+  const attempt = await getLedgerEntry(key);
+  if (attempt?.state === 'delivered') {
     if (source === 'remote') ackRemote(event);
     return;
   }
 
   // A stopped attempt is final: replays (relay reconnect, the other source)
   // are dropped, never re-sent. It is not ACKed — nothing proved a send.
-  const attempt = await getEventAttempt(key);
   if (attempt && attempt.state !== 'inflight') {
     console.warn('[AI Studio Bridge] Not re-sending an unconfirmed completion', {
       eventKey: key,
@@ -354,7 +346,7 @@ const handleCompletion = async (event, source) => {
       eventKey: key,
       detail,
     });
-    await setEventAttempt(key, { state: 'stopped', detail });
+    await setLedgerEntry(key, { state: 'stopped', detail });
     await recordDelivery('stopped', event.routeId, detail);
     await setBadge('!');
     return;
@@ -367,8 +359,7 @@ const handleCompletion = async (event, source) => {
   }
 
   pendingRouteIds.delete(event.routeId.trim().toLowerCase());
-  await markDelivered(key);
-  await setEventAttempt(key, null);
+  await setLedgerEntry(key, { state: 'delivered' });
   if (source === 'remote') ackRemote(event);
 };
 

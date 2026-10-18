@@ -5,11 +5,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  FAST_TIMING,
   composerTextOf,
   delay,
   fakeElement as el,
   markerIdsIn,
   sendTaskCompleted,
+  sendToContent,
   setComposerText,
   withPage,
 } from './helpers/fake-dom.js';
@@ -41,7 +43,7 @@ test('a send button that stays disabled leaves the text for the user and never r
     assert.equal(first.ok, false);
     assert.equal(first.state, 'unsent');
     assert.equal(first.retryable, false, 'something was written: never invite a retry');
-    assert.match(first.detail, /^send-disabled;clicks=0$/);
+    assert.equal(first.detail, 'send-disabled');
     assert.equal(world.sendButton.clicks, 0);
     assert.match(composerTextOf(world), /修复双发/);
     assert.deepEqual(markerIdsIn(composerTextOf(world)), [ROUTE_ID]);
@@ -115,24 +117,105 @@ test('a framework that missed the first input event is nudged until send enables
     assert.equal(composerTextOf(world), '', 'the nudge never changed the text');
   }));
 
-test('a click the page ignored is retried after it settles; still exactly one message', () =>
-  withPage({ app: { accept: (app) => (app.tries = (app.tries ?? 0) + 1) > 1 } }, async (world) => {
+// --- At most one click per event -------------------------------------------------
+
+test('a click ChatGPT accepted but shows only 3s later is never clicked again', () =>
+  withPage({
+    app: { latencyMs: 3000 },
+    timing: { ...FAST_TIMING, clickConfirmMs: 10000 },
+  }, async (world) => {
     const response = await sendTaskCompleted(world, PROMPT, 'evt-1');
 
     assert.equal(response.ok, true);
-    assert.equal(world.sendButton.clicks, 2);
+    assert.equal(world.sendButton.clicks, 1);
+    assert.equal(world.app.accepted, 1);
     assert.equal(world.app.sent.length, 1);
   }));
 
-test('a page that ignores every click is not clicked forever and not reported as sent', quietly(() =>
+test('a 6s render delay with the composer already cleared is still one click, one message', () =>
+  withPage({
+    app: { latencyMs: 6000, clearFirst: true },
+    timing: { ...FAST_TIMING, clickConfirmMs: 10000 },
+  }, async (world) => {
+    const response = await sendTaskCompleted(world, PROMPT, 'evt-1');
+
+    assert.equal(response.ok, true);
+    assert.equal(world.sendButton.clicks, 1);
+    assert.equal(world.app.sent.length, 1);
+  }));
+
+test('a send slower than the confirm window is unconfirmed, not re-clicked', quietly(() =>
+  withPage({ app: { latencyMs: 400 } }, async (world) => {
+    const response = await sendTaskCompleted(world, PROMPT, 'evt-1');
+
+    assert.equal(response.state, 'unconfirmed');
+    assert.equal(response.retryable, false);
+    assert.equal(world.sendButton.clicks, 1);
+
+    // It lands later; a replay of the event must not add a second one.
+    await delay(300);
+    const replay = await sendTaskCompleted(world, PROMPT, 'evt-1');
+    assert.equal(replay.state, 'unconfirmed');
+    assert.equal(world.sendButton.clicks, 1);
+    assert.equal(world.app.sent.length, 1);
+  })));
+
+test('an ignored click degrades safely: no second click, draft kept for the user', quietly(() =>
   withPage({ app: { accept: () => false } }, async (world) => {
     const response = await sendTaskCompleted(world, PROMPT, 'evt-1');
 
-    assert.equal(response.state, 'unsent');
-    assert.match(response.detail, /^not-accepted;clicks=3$/);
-    assert.equal(world.sendButton.clicks, 3);
+    assert.equal(response.state, 'unconfirmed');
+    assert.equal(response.detail, 'click-not-confirmed;draft-kept');
+    assert.equal(response.retryable, false);
+    assert.equal(world.sendButton.clicks, 1);
+    assert.match(composerTextOf(world), /修复双发/);
+    assert.deepEqual(markerIdsIn(composerTextOf(world)), [ROUTE_ID]);
     assert.equal(world.app.sent.length, 0);
+
+    const replay = await sendTaskCompleted(world, PROMPT, 'evt-1');
+    assert.equal(replay.state, 'unconfirmed');
+    assert.equal(world.sendButton.clicks, 1);
   })));
+
+test('an ignored click, then the user sends the kept draft: one message, reported sent', () =>
+  withPage({ app: { accept: () => false } }, async (world) => {
+    setTimeout(() => world.app.submit(), 60);
+
+    const response = await sendTaskCompleted(world, PROMPT, 'evt-1');
+
+    assert.equal(response.ok, true);
+    assert.equal(world.sendButton.clicks, 1);
+    assert.equal(world.app.sent.length, 1);
+  }));
+
+test('a resumed event with no page record stops instead of starting a send', quietly(() =>
+  withPage({}, async (world) => {
+    const response = await sendToContent(world, {
+      type: 'aiStudio.taskCompleted',
+      prompt: PROMPT,
+      eventKey: 'evt-1',
+      resume: true,
+    });
+
+    assert.equal(response.state, 'ambiguous');
+    assert.equal(response.detail, 'no-record-for-resumed-attempt');
+    assert.equal(composerTextOf(world), '');
+    assert.equal(world.sendButton.clicks, 0);
+  })));
+
+test('a resumed event the page already sent is answered from its record', () =>
+  withPage({}, async (world) => {
+    await sendTaskCompleted(world, PROMPT, 'evt-1');
+    const response = await sendToContent(world, {
+      type: 'aiStudio.taskCompleted',
+      prompt: PROMPT,
+      eventKey: 'evt-1',
+      resume: true,
+    });
+
+    assert.equal(response.ok, true);
+    assert.equal(world.app.sent.length, 1);
+  }));
 
 test('click() alone is not success: a cleared composer without a sent turn is unconfirmed', quietly(() =>
   withPage({ app: false }, async (world) => {

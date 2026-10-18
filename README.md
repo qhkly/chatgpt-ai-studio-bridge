@@ -83,10 +83,14 @@ The composer is never overwritten: if the user is typing, the notification waits
 
 1. **等待**：输入框为空且没有回复在生成才写入；60 秒内等不到 → `busy`，什么都没写，可重试。
 2. **填入**：写入通知 + route marker 并读回校验；marker 校验失败 → 撤回自己写的内容，`inject-failed`，不发送。
-3. **提交**：只有输入框里**仍然恰好是我们的文字**、发送按钮可用（`disabled`/`aria-disabled` 都不算）时才点击；按钮暂不可用时等待并补发 `input` 事件让 React 更新状态；点击前同一任务内再次校验/修复 marker。点击后 2 秒文字仍原样未动才视为没点上，最多点 3 次。
-4. **确认**：`click()` 本身不算成功。只有出现带这段通知的新用户消息（`[data-message-author-role="user"]`，与填入前的数量比较），或文字离开输入框后开始生成回复，才算 `sent`。
+3. **提交**：只有输入框里**仍然恰好是我们的文字**、发送按钮可用（`disabled`/`aria-disabled` 都不算）时才点击；点击前按钮暂不可用时等待并补发 `input` 事件让 React 更新状态；点击前同一任务内再次校验/修复 marker。**每个事件最多点击一次**：ChatGPT 可能已经接收但界面迟迟不显示（React/网络慢），再点一次就可能双发，所以界面慢绝不作为重试理由。
+4. **确认**：`click()` 本身不算成功。只有出现带这段通知的新用户消息（`[data-message-author-role="user"]`，与填入前的数量比较），或文字离开输入框后开始生成回复，才算 `sent`。点击后最多等 30 秒；仍无证据 → `unconfirmed`，草稿原样留给用户（`click-not-confirmed;draft-kept`）。
 
-停止条件（终态，不重试、不 ACK、角标 `!`，弹窗显示原因）：用户改了文字（`user-modified`，不再碰输入框）、用户删掉了文字（`cleared`）、45 秒内没能提交（`unsent`，文字留给用户手动发送）、点击后文字消失但没有发送证据（`unconfirmed`）、页面脚本回应前通道断开（`ambiguous`）。
+停止条件（终态，不重试、不 ACK、角标 `!`，弹窗显示原因）：用户改了文字（`user-modified`，不再碰输入框）、用户删掉了文字（`cleared`）、45 秒内按钮一直不可用、从未点击（`unsent`，文字留给用户手动发送）、点击后无法证明发出（`unconfirmed`）、页面脚本回应前通道断开或接续的旧尝试在页面上没有记录（`ambiguous`）。
 
-去重：页面用 sessionStorage 记录事件状态（只记 eventId 与状态，不记消息正文），重复投递/中继重放只返回已记录的结果，不会重新填写；后台在发送前把事件记为 `inflight`，终态记为 `stopped`，之后同一事件的本地/远程副本一律丢弃。远程事件只在确认发出后 ACK。
+去重：后台在 `chrome.storage.local` 的 `eventLedger` 里按 eventId 记录 `inflight` / `delivered` / `stopped`，同一事件的本地/远程副本、中继重放都先查它：`delivered` 只补 ACK，`stopped` 直接丢弃。远程事件只在确认发出后 ACK。保留策略按实际中继的上限设计（`src/event-ledger.js`）：中继未 ACK 事件最长保留 7 天（`EVENT_RETENTION_SECONDS` 上限）、每 channel 最多 5000 条（`MAX_EVENTS_PER_CHANNEL` 上限）；账本条目保留 8 天（7 天 + 1 天时钟偏差余量）且最多 5000 条，超出任一界限时中继也已不可能再重放该事件。本地桥只做实时广播、没有积压。旧版 `recentEventIds` 里的已送达记录升级后仍然有效。
+
+页面侧用 sessionStorage 记录事件状态（只记 eventId 与状态，不记消息正文，8 天 / 500 条），重复投递只返回已记录的结果。Service worker 或浏览器重启后接续一个 `inflight` 事件时，后台带上 `resume`，页面没有记录就停止（`ambiguous`），不会重新开始发送。
+
+无法完全保证的情形：中继配置超过上述上限；ChatGPT 改了用户消息/停止按钮的 DOM（真实发出也会显示 `unconfirmed`，宁可漏报不双发）；用户在点击后、界面显示前自己又发了一次同样的草稿。
 
