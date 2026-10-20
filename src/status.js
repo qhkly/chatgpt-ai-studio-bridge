@@ -202,6 +202,7 @@ const INJECTION_REASONS = [
   [/^composer-not-found(?::|$)/, '找不到 ChatGPT 输入框'],
   [/^settled-readback-mismatch$/, 'marker 写入后被页面还原'],
   [/^pre-send-readback-mismatch$/, '发送前最终校验未通过'],
+  [/^unmarked-send:/, '有消息未带 route marker 就发出（如 ChatGPT 原生语音直发），对应工人不会绑定本对话'],
   [/^probe-cleanup-failed$/, '检测后无法清理输入框'],
   [/readback-mismatch/, 'marker 写入后读回不一致'],
 ];

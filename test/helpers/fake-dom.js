@@ -227,6 +227,11 @@ const createWorld = ({ execCommand } = {}) => {
     removeItem: (key) => sessionStorageMap.delete(key),
   };
 
+  const intervals = [];
+  const location = {
+    pathname: '/c/' + CONVERSATION_ID,
+    href: 'https://chatgpt.com/c/' + CONVERSATION_ID,
+  };
   const sentMessages = [];
   const messageListeners = [];
   const chrome = {
@@ -249,6 +254,13 @@ const createWorld = ({ execCommand } = {}) => {
     sentMessages,
     messageListeners,
     conversationId: CONVERSATION_ID,
+    location,
+    tick: () => intervals.forEach((fn) => fn()),
+    // Simulates an SPA navigation (no reload).
+    navigate: (path) => {
+      location.pathname = path;
+      location.href = 'https://chatgpt.com' + path;
+    },
     routeId: null,
     // What the background answers; route registrations succeed by default.
     respondToMessage: (message) =>
@@ -271,13 +283,13 @@ const createWorld = ({ execCommand } = {}) => {
     HTMLTextAreaElement: FakeHTMLTextAreaElement,
     Event: FakeEvent,
     InputEvent: FakeInputEvent,
-    location: {
-      pathname: '/c/' + CONVERSATION_ID,
-      href: 'https://chatgpt.com/c/' + CONVERSATION_ID,
+    location,
+    // The reconcile loop would keep the test process alive; it is captured
+    // and driven by hand (world.tick()).
+    setInterval: (fn) => {
+      intervals.push(fn);
+      return 0;
     },
-    // The 1s reconcile loop would keep the test process alive; the harness
-    // only cares about event-driven behavior.
-    setInterval: () => 0,
   };
 
   const previous = Object.fromEntries(

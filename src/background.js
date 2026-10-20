@@ -158,22 +158,33 @@ const findTabForRoute = async (routeId) => {
   if (!binding) return null;
   if (Date.now() - Number(binding.at || 0) > ROUTE_TTL_MS) return null;
 
+  // The stored URL is the conversation this route was registered for. A tab
+  // that has since navigated elsewhere (A -> B) is no longer that
+  // conversation: delivering there would post A's completion into B.
+  // Mismatch fails safe; the page re-registers its route on every URL change,
+  // so a legitimate same-conversation change (new chat -> /c/<id>) heals
+  // within a second and the unmatched event is replayed then.
+  if (!binding.url) return null;
+
   if (binding.tabId) {
     try {
       const tab = await chrome.tabs.get(binding.tabId);
-      if (tab?.id && isChatGptUrl(tab.url)) return tab;
+      if (tab?.id && isChatGptUrl(tab.url) && tab.url === binding.url) return tab;
     } catch {
       // Fall back to the exact stored conversation URL.
     }
   }
 
-  if (!binding.url) return null;
+  // Only a concrete conversation URL identifies a tab. The bare "new chat"
+  // page is shared by every fresh tab, and two tabs on the same URL cannot be
+  // told apart: both are refused rather than guessed.
+  if (!/\/c\/[0-9a-f-]{36}(?:[/?#]|$)/i.test(binding.url)) return null;
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  const exact = tabs.find((tab) => tab.url === binding.url);
-  if (!exact?.id) return null;
+  const exact = tabs.filter((tab) => tab.url === binding.url);
+  if (exact.length !== 1 || !exact[0].id) return null;
 
-  await saveRouteBinding(routeId.trim().toLowerCase(), exact.id);
-  return exact;
+  await saveRouteBinding(routeId.trim().toLowerCase(), exact[0].id);
+  return exact[0];
 };
 
 const ensureContentScript = async (tabId) => {

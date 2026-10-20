@@ -94,3 +94,9 @@ The composer is never overwritten: if the user is typing, the notification waits
 
 无法完全保证的情形：中继配置超过上述上限；ChatGPT 改了用户消息/停止按钮的 DOM（真实发出也会显示 `unconfirmed`，宁可漏报不双发）；用户在点击后、界面显示前自己又发了一次同样的草稿。
 
+
+## Voice input and route binding
+
+- **Typed text / ChatGPT dictation** (transcript lands in the composer, then the normal send control or Enter): supported. The route marker is injected and read back at send time; the transcript is never altered.
+- **ChatGPT native Live voice** (sent without the composer): cannot be marked. The bridge does not guess a route; when a user turn appears with no verified marker it raises the `!` badge ("unmarked-send"), and a worker created from that turn is unbound. Send the task by text or dictation, or pass the route UUID shown in the popup to the worker manually. A reliable fix needs a product-level protocol (e.g. AI Studio exposing the route through a ChatGPT-supported channel).
+- Completions are delivered only to a tab whose URL still equals the URL the route was registered with; a tab that navigated to another conversation, or ambiguous duplicate tabs, fail safe as "unmatched".

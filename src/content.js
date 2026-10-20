@@ -18,13 +18,17 @@ const SEND_TIMING = {
   // Re-announce the unchanged text so a framework that missed the first
   // input event can enable the send button. Only before the click.
   nudgeMs: 1000,
+  // Unmarked-send watch (see watchUnmarkedSends).
+  routeSyncMs: 1000,
+  unmarkedSettleMs: 5000,
+  markedSendWindowMs: 15000,
   ...(globalThis.__aiStudioBridgeTiming ?? {}),
 };
-const ROUTE_SYNC_MS = 1000;
 // Automated sends can afford to wait one render cycle before trusting a
 // write: framework re-renders that revert the composer happen asynchronously.
 const MARKER_SETTLE_MS = 50;
 const MARKER_INJECT_ATTEMPTS = 3;
+const USER_TURN_SELECTOR = '[data-message-author-role="user"]';
 const ROUTE_PENDING_KEY = 'aiStudio.route.pending';
 const ROUTE_CONVERSATION_PREFIX = 'aiStudio.route.conversation.';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -476,6 +480,7 @@ const injectRouteMarker = (
 
   for (let attempt = 0; attempt < MARKER_INJECT_ATTEMPTS; attempt++) {
     if (markerVerified(composer, routeId)) {
+      if (source !== 'probe') lastMarkedSendAt = Date.now();
       reportInjectionOutcome(true, routeId, null, source);
       return { ok: true, routeId };
     }
@@ -483,6 +488,7 @@ const injectRouteMarker = (
     writePrompt(composer, buildTextWithMarker(composerRawText(composer), routeId));
 
     if (markerVerified(composer, routeId)) {
+      if (source !== 'probe') lastMarkedSendAt = Date.now();
       reportInjectionOutcome(true, routeId, null, source);
       return { ok: true, routeId };
     }
@@ -561,6 +567,50 @@ const reconcileRoute = () => {
   registerCurrentRoute();
 };
 
+// --- Unmarked-send watch ------------------------------------------------------
+// The marker is only ever written on a send gesture inside the DOM composer
+// (pointerdown / click / Enter / submit). A user turn that appears without a
+// verified marker was therefore sent some other way — typically ChatGPT's
+// native Live voice, which never goes through the composer, or a dictation
+// submit control we do not recognise. We cannot add the marker after the
+// fact (and never guess a route), so the only safe move is to say so: the
+// worker created from that turn has no route and will not get a completion.
+// Purely passive: no composer writes, no focus, no private API.
+const UNMARKED_DETAIL = 'unmarked-send:user-turn-without-route-marker';
+let lastMarkedSendAt = 0;
+let watchUrl = '';
+let watchSince = 0;
+let watchTurns = 0;
+
+const userTurnCount = () => queryAll(document, USER_TURN_SELECTOR).length;
+
+const watchUnmarkedSends = () => {
+  const now = Date.now();
+  const count = userTurnCount();
+
+  // New page / new conversation: the turns that render now are history.
+  if (location.href !== watchUrl) {
+    watchUrl = location.href;
+    watchSince = now;
+    watchTurns = count;
+    return;
+  }
+  if (count < watchTurns) watchTurns = count;
+  if (count === watchTurns) return;
+
+  const added = count - watchTurns;
+  watchTurns = count;
+  // History still loading after navigation, or a bulk render: not a send.
+  if (now - watchSince < SEND_TIMING.unmarkedSettleMs || added > 2) return;
+
+  const marked = lastMarkedSendAt > 0 &&
+    now - lastMarkedSendAt <= SEND_TIMING.markedSendWindowMs;
+  lastMarkedSendAt = 0; // one verified marker covers one turn
+  if (added - (marked ? 1 : 0) <= 0) return;
+
+  reportInjectionOutcome(false, getOrCreateRouteId(), UNMARKED_DETAIL, 'send');
+};
+
 const sleep = async (ms) =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -581,7 +631,6 @@ const DELIVERY_RECORD_TTL_MS = 8 * 24 * 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 500;
 // Nothing was written to the composer, so the background may retry.
 const RETRYABLE_DELIVERY_STATES = new Set(['busy', 'composer-not-found']);
-const USER_TURN_SELECTOR = '[data-message-author-role="user"]';
 
 // Per-tab record (sessionStorage survives reloads and content-script
 // re-injection) so a redelivered event is answered, not re-sent. Holds the
@@ -934,4 +983,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 reconcileRoute();
-setInterval(reconcileRoute, ROUTE_SYNC_MS);
+watchUnmarkedSends();
+setInterval(() => {
+  reconcileRoute();
+  watchUnmarkedSends();
+}, SEND_TIMING.routeSyncMs);
