@@ -30,6 +30,9 @@ const MARKER_SETTLE_MS = 50;
 const MARKER_INJECT_ATTEMPTS = 3;
 const USER_TURN_SELECTOR = '[data-message-author-role="user"]';
 const ROUTE_PENDING_KEY = 'aiStudio.route.pending';
+// Set once a marker was verified on the new-chat page: only then does the
+// pending route belong to the conversation that page turns into.
+const ROUTE_PENDING_USED_KEY = 'aiStudio.route.pending.used';
 const ROUTE_CONVERSATION_PREFIX = 'aiStudio.route.conversation.';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Markdown reference-definition marker: invisible when rendered, but kept in
@@ -345,10 +348,18 @@ const getOrCreateRouteId = () => {
     const saved = normalizeRouteId(storageGet(key));
     if (saved) return saved;
 
-    const pending = normalizeRouteId(storageGet(ROUTE_PENDING_KEY));
+    // A pending route is adopted only if a send actually happened on the
+    // new-chat page; navigating from there to some existing conversation
+    // must not hand it that conversation.
+    const pending = storageGet(ROUTE_PENDING_USED_KEY) === '1'
+      ? normalizeRouteId(storageGet(ROUTE_PENDING_KEY))
+      : null;
     const routeId = pending ?? crypto.randomUUID().toLowerCase();
     storageSet(key, routeId);
+    // Adopted, or never sent from: either way this pending route is spent
+    // and must not resurface on a later blank chat.
     storageRemove(ROUTE_PENDING_KEY);
+    storageRemove(ROUTE_PENDING_USED_KEY);
     return routeId;
   }
 
@@ -358,6 +369,20 @@ const getOrCreateRouteId = () => {
   const routeId = crypto.randomUUID().toLowerCase();
   storageSet(ROUTE_PENDING_KEY, routeId);
   return routeId;
+};
+
+// The route this page is bound to right now, without creating or consuming
+// anything. null when the page has none (e.g. an unmapped conversation).
+const peekRouteId = () => {
+  const conversationId = conversationIdFromUrl();
+  if (conversationId) {
+    const saved = normalizeRouteId(storageGet(ROUTE_CONVERSATION_PREFIX + conversationId));
+    if (saved) return saved;
+    return storageGet(ROUTE_PENDING_USED_KEY) === '1'
+      ? normalizeRouteId(storageGet(ROUTE_PENDING_KEY))
+      : null;
+  }
+  return normalizeRouteId(storageGet(ROUTE_PENDING_KEY));
 };
 
 // Resolves true once the background has persisted the binding.
@@ -480,7 +505,7 @@ const injectRouteMarker = (
 
   for (let attempt = 0; attempt < MARKER_INJECT_ATTEMPTS; attempt++) {
     if (markerVerified(composer, routeId)) {
-      if (source !== 'probe') lastMarkedSendAt = Date.now();
+      if (source !== 'probe') markSendInjected();
       reportInjectionOutcome(true, routeId, null, source);
       return { ok: true, routeId };
     }
@@ -488,7 +513,7 @@ const injectRouteMarker = (
     writePrompt(composer, buildTextWithMarker(composerRawText(composer), routeId));
 
     if (markerVerified(composer, routeId)) {
-      if (source !== 'probe') lastMarkedSendAt = Date.now();
+      if (source !== 'probe') markSendInjected();
       reportInjectionOutcome(true, routeId, null, source);
       return { ok: true, routeId };
     }
@@ -561,9 +586,19 @@ const probeInjection = async () => {
   };
 };
 
+let lastObservedConversation = null;
+
 const reconcileRoute = () => {
   if (location.href === lastObservedUrl) return;
   lastObservedUrl = location.href;
+  const conversationId = conversationIdFromUrl();
+  // Back to a blank chat from a conversation: whatever pending route was left
+  // over belongs to an earlier blank page. A new chat gets its own route.
+  if (!conversationId && lastObservedConversation) {
+    storageRemove(ROUTE_PENDING_KEY);
+    storageRemove(ROUTE_PENDING_USED_KEY);
+  }
+  lastObservedConversation = conversationId;
   registerCurrentRoute();
 };
 
@@ -578,6 +613,10 @@ const reconcileRoute = () => {
 // Purely passive: no composer writes, no focus, no private API.
 const UNMARKED_DETAIL = 'unmarked-send:user-turn-without-route-marker';
 let lastMarkedSendAt = 0;
+const markSendInjected = () => {
+  lastMarkedSendAt = Date.now();
+  if (!conversationIdFromUrl()) storageSet(ROUTE_PENDING_USED_KEY, '1');
+};
 let watchUrl = '';
 let watchSince = 0;
 let watchTurns = 0;
@@ -630,7 +669,8 @@ const DELIVERY_RECORDS_KEY = 'aiStudio.deliveries';
 const DELIVERY_RECORD_TTL_MS = 8 * 24 * 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 500;
 // Nothing was written to the composer, so the background may retry.
-const RETRYABLE_DELIVERY_STATES = new Set(['busy', 'composer-not-found']);
+// 'route-mismatch' is only ever returned before anything was written.
+const RETRYABLE_DELIVERY_STATES = new Set(['busy', 'composer-not-found', 'route-mismatch']);
 
 // Per-tab record (sessionStorage survives reloads and content-script
 // re-injection) so a redelivered event is answered, not re-sent. Holds the
@@ -696,9 +736,11 @@ const nudgeComposer = (composer) => {
   composer.dispatchEvent(new Event('input', { bubbles: true }));
 };
 
-const waitForIdleComposer = async () => {
+const waitForIdleComposer = async (routeProblem) => {
   const deadline = Date.now() + SEND_TIMING.waitEmptyMs;
   for (;;) {
+    const problem = routeProblem();
+    if (problem) return { state: 'route-mismatch', detail: problem };
     const composer = findComposer();
     const busy = composer && (nonMarkerText(composer) !== '' || isGenerating());
     if (composer && !busy) return { composer };
@@ -726,7 +768,7 @@ const retractFill = (prompt, detail) => {
 // so a second click could post the message twice. From then on we only
 // watch; if nothing proves the send, the event stops as unconfirmed and the
 // draft (if still there) is left for the user.
-const submitFilledPrompt = async (prompt, baseline) => {
+const submitFilledPrompt = async (prompt, baseline, routeProblem) => {
   const submitDeadline = Date.now() + SEND_TIMING.submitMs;
   let clickedAt = 0;
   let lastNudgeAt = Date.now();
@@ -755,6 +797,11 @@ const submitFilledPrompt = async (prompt, baseline) => {
           return { state: 'unconfirmed', detail: 'click-not-confirmed;draft-kept' };
         }
       } else {
+        const problem = routeProblem();
+        if (problem) {
+          // Still our draft and never clicked: take it back, send nothing.
+          return { state: 'route-changed', detail: retractFill(prompt, problem) };
+        }
         const button = findSendButton(composer);
         if (button && isSendEnabled(button) && !isGenerating()) {
           // Pre-send read-back, repaired within the same task as the click.
@@ -763,6 +810,11 @@ const submitFilledPrompt = async (prompt, baseline) => {
               state: 'inject-failed',
               detail: retractFill(prompt, 'pre-send-readback-mismatch'),
             };
+          }
+          // Last look, same task as the click: nothing async in between.
+          const lastProblem = routeProblem();
+          if (lastProblem) {
+            return { state: 'route-changed', detail: retractFill(prompt, lastProblem) };
           }
           button.click();
           clickedAt = Date.now();
@@ -799,7 +851,22 @@ const submitFilledPrompt = async (prompt, baseline) => {
   }
 };
 
-const runDelivery = async (prompt, key) => {
+// The completion was produced for one conversation. It may only be posted
+// while this page still is that conversation: same route, and the URL's
+// conversation id has not changed since the attempt began (a blank chat
+// turning into /c/<id> is the one allowed change).
+const makeRouteGuard = (expectedRouteId) => {
+  const startConversation = conversationIdFromUrl();
+  return () => {
+    if (!expectedRouteId) return 'no-expected-route';
+    const current = conversationIdFromUrl();
+    if (startConversation && current !== startConversation) return 'conversation-changed';
+    if (peekRouteId() !== expectedRouteId) return 'route-differs';
+    return null;
+  };
+};
+
+const runDelivery = async (prompt, key, routeProblem) => {
   const finish = ({ state, detail = null }) => {
     const result = deliveryResult(state, detail);
     if (key) {
@@ -811,10 +878,13 @@ const runDelivery = async (prompt, key) => {
     return result;
   };
 
-  const idle = await waitForIdleComposer();
+  const idle = await waitForIdleComposer(routeProblem);
   if (!idle.composer) return finish(idle);
 
   const { composer } = idle;
+  // Nothing written yet: a mismatch here is a plain, retryable refusal.
+  const beforeWrite = routeProblem();
+  if (beforeWrite) return finish({ state: 'route-mismatch', detail: beforeWrite });
   // Recorded before the first write: from here on this event is never
   // started again, only answered.
   if (key) writeDeliveryRecord(key, { state: 'pending' });
@@ -835,7 +905,11 @@ const runDelivery = async (prompt, key) => {
   // reverted the marker is repaired right before the click (same task);
   // anything the user did meanwhile is classified, never written over.
   await sleep(MARKER_SETTLE_MS);
-  return finish(await submitFilledPrompt(prompt, baseline));
+  const afterSettle = routeProblem();
+  if (afterSettle) {
+    return finish({ state: 'route-changed', detail: retractFill(prompt, afterSettle) });
+  }
+  return finish(await submitFilledPrompt(prompt, baseline, routeProblem));
 };
 
 const activeDeliveries = new Map();
@@ -843,7 +917,7 @@ let deliveryChain = Promise.resolve();
 
 // One delivery at a time per tab, and one run per event key: a concurrent
 // copy joins the running attempt, a later copy gets the recorded outcome.
-const deliverCompletion = (prompt, key, resume = false) => {
+const deliverCompletion = (prompt, key, resume = false, expectedRouteId = null) => {
   if (key) {
     const running = activeDeliveries.get(key);
     if (running) return running;
@@ -863,7 +937,10 @@ const deliverCompletion = (prompt, key, resume = false) => {
     }
   }
 
-  const job = deliveryChain.then(() => runDelivery(prompt, key));
+  // Anchored to the page as it is when the event arrives, not when its turn
+  // in the queue comes.
+  const routeProblem = makeRouteGuard(expectedRouteId);
+  const job = deliveryChain.then(() => runDelivery(prompt, key, routeProblem));
   deliveryChain = job.catch(() => {});
   if (key) {
     activeDeliveries.set(key, job);
@@ -971,7 +1048,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const key = typeof message.eventKey === 'string' && message.eventKey
     ? message.eventKey
     : null;
-  deliverCompletion(message.prompt, key, message.resume === true)
+  deliverCompletion(
+    message.prompt,
+    key,
+    message.resume === true,
+    normalizeRouteId(message.expectedRouteId),
+  )
     .then(sendResponse)
     .catch((error) => {
       console.error('[AI Studio Bridge] Failed to send prompt', error);

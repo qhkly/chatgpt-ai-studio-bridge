@@ -157,3 +157,34 @@ test('closed new-chat tab: the shared bare URL never identifies a tab', withBack
     assert.equal(calls.length, 0);
   },
 ));
+
+test('the tab moving on during the pre-send awaits is caught by the re-check', withBackground(
+  [{ id: 7, url: URL_A }],
+  async (world) => {
+    const calls = [];
+    world.tabHandlers.set(7, async (message) => {
+      if (message.type === 'aiStudio.ping') {
+        world.tabMap.get(7).url = URL_B; // navigates while ensureContentScript runs
+        return { ok: true };
+      }
+      if (message.type === 'aiStudio.taskCompleted') calls.push(message);
+      return { ok: true, state: 'sent', retryable: false };
+    });
+    await register(world, 7, ROUTE_A);
+
+    await complete(world, ROUTE_A, 'evt-1');
+
+    assert.equal(calls.length, 0);
+    assert.equal((await lastDelivery(world)).outcome, 'unmatched');
+  },
+));
+
+test('the page is told which route the event belongs to', withBackground(
+  [{ id: 7, url: URL_A }],
+  async (world) => {
+    const calls = attach(world, 7);
+    await register(world, 7, ROUTE_A);
+    await complete(world, ROUTE_A, 'evt-1');
+    assert.equal(calls[0].expectedRouteId, ROUTE_A);
+  },
+));

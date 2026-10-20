@@ -492,7 +492,7 @@ export const sendTaskCompleted = async (world, prompt, eventKey) => {
   );
   return new Promise((resolve) => {
     const async = listener(
-      { type: 'aiStudio.taskCompleted', prompt, eventKey },
+      { type: 'aiStudio.taskCompleted', prompt, eventKey, expectedRouteId: world.routeId },
       {},
       resolve,
     );

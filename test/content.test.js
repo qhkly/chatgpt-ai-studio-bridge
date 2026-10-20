@@ -439,3 +439,15 @@ test('after an SPA route change the next send carries the new conversation route
     world.restoreGlobals();
   }
 });
+
+// A programmatic button.click() (e.g. another extension's sendPrompt) fires a
+// click event with no preceding pointerdown; the click listener alone must
+// mark the message.
+test('a lone programmatic click on the send button injects the marker', () => {
+  const world = setupPage({ composer: 'textarea' });
+  setComposerText(world, 'sent by another extension');
+
+  dispatch(world, 'click', world.sendButton, { isTrusted: false });
+
+  assert.equal(markerIdsIn(composerTextOf(world)).join(), ROUTE_ID);
+});

@@ -426,3 +426,121 @@ test('an unrepairable marker before the click withholds the send and retracts ou
     assert.equal(world.sendButton.clicks, 0);
     assert.equal(world.app.sent.length, 0);
   })));
+
+// --- The page must still be the conversation the event belongs to -----------
+const CONV_B = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+const OTHER_ROUTE = '99999999-8888-7777-6666-555555555555';
+const PENDING_KEY = 'aiStudio.route.pending';
+const USED_KEY = 'aiStudio.route.pending.used';
+const completed = (world, extra = {}) => sendToContent(world, {
+  type: 'aiStudio.taskCompleted',
+  prompt: PROMPT,
+  eventKey: 'evt-r',
+  expectedRouteId: ROUTE_ID,
+  ...extra,
+});
+
+test('an event for another route is refused before anything is written (retryable)', quietly(() =>
+  withPage({}, async (world) => {
+    const response = await completed(world, { expectedRouteId: OTHER_ROUTE });
+    assert.equal(response.state, 'route-mismatch');
+    assert.equal(response.retryable, true);
+    assert.equal(composerTextOf(world), '');
+    assert.equal(world.sendButton.clicks, 0);
+  })));
+
+test('an event without an expected route is refused', quietly(() =>
+  withPage({}, async (world) => {
+    const response = await completed(world, { expectedRouteId: undefined });
+    assert.equal(response.state, 'route-mismatch');
+    assert.equal(world.sendButton.clicks, 0);
+  })));
+
+test('navigating A -> B while waiting for an idle composer sends nothing and keeps the user text', quietly(() =>
+  withPage({}, async (world) => {
+    setComposerText(world, 'my own draft');
+    const pending = completed(world);
+    await delay(30);
+    world.navigate('/c/' + CONV_B);
+    const response = await pending;
+
+    assert.equal(response.state, 'route-mismatch');
+    assert.equal(response.retryable, true);
+    assert.equal(composerTextOf(world), 'my own draft');
+    assert.equal(world.sendButton.clicks, 0);
+  })));
+
+test('navigating A -> B after the fill, before the click: draft taken back, no send, not retryable', quietly(() =>
+  withPage({}, async (world) => {
+    world.sendButton.disabled = true;
+    const pending = completed(world);
+    await delay(60);
+    assert.match(composerTextOf(world), /修复双发/);
+    world.navigate('/c/' + CONV_B);
+    world.sendButton.disabled = false;
+    const response = await pending;
+
+    assert.equal(response.state, 'route-changed');
+    assert.equal(response.retryable, false);
+    assert.equal(world.sendButton.clicks, 0);
+    assert.equal(world.app.sent.length, 0);
+    assert.equal(composerTextOf(world).trim(), '');
+  })));
+
+test('a blank chat becoming /c/<id> is the same conversation and still sends', () =>
+  withPage({}, async (world) => {
+    world.navigate('/');
+    world.sessionStorage.setItem(PENDING_KEY, OTHER_ROUTE);
+    world.sendButton.disabled = true;
+    const pending = completed(world, { expectedRouteId: OTHER_ROUTE });
+    await delay(60);
+    world.navigate('/c/' + CONV_B); // the first send of this chat created it
+    world.sendButton.disabled = false;
+    const response = await pending;
+
+    assert.equal(response.ok, true);
+    assert.equal(world.sendButton.clicks, 1);
+  }));
+
+// --- pending route lifecycle (chat A -> blank -> chat B) ---------------------
+
+test('a blank chat that is never sent from does not hand its route to an existing conversation', () =>
+  withPage({}, async (world) => {
+    world.navigate('/');
+    world.tick();
+    const blankRoute = world.sessionStorage.getItem(PENDING_KEY);
+    assert.ok(blankRoute);
+
+    world.navigate('/c/' + CONV_B); // opened an old conversation, no send
+    world.tick();
+    const convRoute = world.sessionStorage.getItem('aiStudio.route.conversation.' + CONV_B);
+    assert.notEqual(convRoute, blankRoute);
+    assert.equal(world.sessionStorage.getItem(PENDING_KEY), null, 'spent');
+
+    world.navigate('/');
+    world.tick();
+    const next = world.sessionStorage.getItem(PENDING_KEY);
+    assert.ok(next);
+    assert.notEqual(next, blankRoute);
+    assert.notEqual(next, convRoute);
+  }));
+
+test('chat A -> new chat -> chat B: every conversation keeps its own route', () =>
+  withPage({}, async (world) => {
+    const routeA = world.routeId;
+    world.navigate('/');
+    world.tick();
+    const blank1 = world.sessionStorage.getItem(PENDING_KEY);
+    world.navigate('/c/' + CONV_B);
+    world.tick();
+    const routeB = world.sessionStorage.getItem('aiStudio.route.conversation.' + CONV_B);
+    world.navigate('/');
+    world.tick();
+    const blank2 = world.sessionStorage.getItem(PENDING_KEY);
+
+    assert.equal(new Set([routeA, blank1, routeB, blank2]).size, 4);
+    assert.equal(
+      world.sessionStorage.getItem('aiStudio.route.conversation.' + world.conversationId),
+      routeA,
+    );
+  }));

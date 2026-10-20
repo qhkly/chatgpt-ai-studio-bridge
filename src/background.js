@@ -261,9 +261,22 @@ const deliverCompletion = async (event, key, previousAttempt) => {
   // middle of a send finds it.
   await setLedgerEntry(key, { state: 'inflight', tabId: tab.id });
 
+  // The awaits above leave room for the tab to have moved on (A -> B).
+  // Re-resolve the route right before sending; the page checks again itself.
+  const recheck = await findTabForRoute(event.routeId);
+  if (recheck?.id !== tab.id) {
+    console.warn('[AI Studio Bridge] Route no longer matches the tab', event.routeId);
+    if (previousAttempt) return { outcome: 'stopped', detail: 'route-changed' };
+    await setLedgerEntry(key, null);
+    await recordDelivery('unmatched', event.routeId);
+    await setBadge('!');
+    return { outcome: 'unmatched' };
+  }
+
   let result;
   try {
     result = await chrome.tabs.sendMessage(tab.id, {
+      expectedRouteId: event.routeId.trim().toLowerCase(),
       type: 'aiStudio.taskCompleted',
       prompt: buildCompletionPrompt(event),
       eventKey: key,
